@@ -1,0 +1,10 @@
+{
+  "_comment": "EVT typeId = bases[宣言インターフェース] + 自前メソッド順。PIX 2603.25 で観測。根拠は docs/formats/wpix.md",
+  "bases": {
+    "ID3D12Object": 970,
+    "ID3D12GraphicsCommandList": 992,
+    "ID3D12CommandQueue": 1063,
+    "ID3D12Device": 1074,
+    "ID3D12Device4": 1711
+  }
+}
