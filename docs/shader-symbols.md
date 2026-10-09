@@ -46,10 +46,20 @@ PDB が見つかったシェーダは PDB・HLSL ソース・コンパイル引�
 
 - **全シェーダの PDB が見つかった時点で探索を打ち切る**（以降のフォルダ・サーバは見ない）
 - 再帰探索で調べるのは拡張子 `.pdb` か、デバッグ名と同名のファイルのみ（256MB 超は無視）
-- ストア形式: `<root>/<pdb名>/<HASH>/<pdb名>`（HASH は大文字・小文字の両方を試す）、無ければ `<root>/<pdb名>`
+- ストア形式: `<root>/<pdb名>/<index>/<pdb名>`、無ければ `<root>/<pdb名>`
+  - `index` は **symstore / symsrv 標準の PDB 索引 = GUID の書式化（Data1/2/3 はリトルエンディアン）+ Age（hex）** ✅
+  - dxc の PDB は info stream（MSF stream 1）の **GUID の生バイト = シェーダの HASH digest、Age = 1** ✅
+    （例: HASH `3fff508c ce44 5d7f 99d1…` → index `8C50FF3F44CE7F5D99D19F2DE52D373C1`。先頭 8 バイトの並びが入れ替わる）
+  - 互換のため HASH の hex そのまま（大文字・小文字）の `<root>/<pdb名>/<HASH>/<pdb名>` も試す
 
-> 🔶 ストア形式（パスの組み立て方）は、一般的なシンボルストアの構成に合わせた本ツールの規約。
-> PIX 自身がシンボルサーバに問い合わせるパス形式と一致するかは未検証。社内のシンボルサーバの構成に合わせて調整が必要な場合がある。
+検証（2026-10）:
+- PIX 同梱の `symsrv.dll` の `SymbolServerGetIndexStringW(GUID=HASH, Age=1)` が上記 index と一致 ✅
+- PIX は `SymbolHandling.dll` 経由で dbghelp の `SymFindFileInPathW` / `SymSrvGetFileIndexInfoW` を使う（=標準のシンボルサーバ方式）✅
+- `tests/test_shader_symbols.py::test_symstore_layout`: PDB の info stream から独立に計算した index でストア / HTTP を作り解決できる ✅
+- ❓ PIX の GUI が実際にこの index で問い合わせるか: キャプチャを開くだけでは問い合わせが発生しなかった（シェーダ表示時に解決すると推定）。
+  PIX の Symbol Path にストアを設定してシェーダを開き、ソースが表示されるかで確認できる
+- ❓ dbghelp の `SymSrvGetFileIndexInfoW` を dxc の PDB に対して呼ぶと失敗した（原因未調査）。`symstore.exe`（この PC に無い）で
+  そのまま登録できるかは未確認。登録できない場合は上記 index でフォルダを作って配置すればよい
 
 ## 5. 出力
 

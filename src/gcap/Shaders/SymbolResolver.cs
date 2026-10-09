@@ -21,7 +21,10 @@ public sealed class ShaderSymbolKey
 ///   3. シンボルストア / シンボルサーバ (指定順)
 ///        "srv*<cache>*<url>" / "srv*<url>" / "https://..."  … HTTP (cache 指定時は cache にストア形式で保存)
 ///        ローカルパス                                         … ストア形式の直接参照 → 無ければ再帰探索
-///      ストア形式: &lt;root&gt;/&lt;pdb名&gt;/&lt;hash&gt;/&lt;pdb名&gt; (hash は大文字/小文字の両方を試す)
+///      ストア形式: &lt;root&gt;/&lt;pdb名&gt;/&lt;index&gt;/&lt;pdb名&gt;
+///        index = symstore / symsrv 標準 (GUID 書式 + Age)。DXC の PDB は GUID の生バイト = シェーダ HASH, Age = 1
+///                (PDB info stream と symsrv の SymbolServerGetIndexString で確認済み)
+///        互換のため HASH の hex そのまま (大文字/小文字) も試す
 /// 照合: PDB 内のハッシュ (IDxcPdbUtils) → PDB ファイル中の digest バイト列 → ファイル名のみ の順に確度が下がる。
 /// </summary>
 public sealed class SymbolResolver(Dxc? dxc, Action<string>? log = null)
@@ -97,10 +100,20 @@ public sealed class SymbolResolver(Dxc? dxc, Action<string>? log = null)
         if (name is null) yield break;
         if (k.HashHex is not null)
         {
+            yield return $"{name}/{SymStoreIndex(k.HashHex, age: 1)}/{name}";
             yield return $"{name}/{k.HashHex.ToUpperInvariant()}/{name}";
             yield return $"{name}/{k.HashHex}/{name}";
         }
         yield return name;
+    }
+
+    /// <summary>symstore の PDB 索引: GUID を Data1/2/3 (リトルエンディアン) + Data4 の順に大文字 hex で並べ、Age を hex で付ける。</summary>
+    public static string SymStoreIndex(string guidRawHex, int age)
+    {
+        var b = Convert.FromHexString(guidRawHex);
+        if (b.Length != 16) return guidRawHex.ToUpperInvariant() + age.ToString("X");
+        var g = new Guid(b);   // バイト列を GUID の内部表現として解釈 (Data1..3 はリトルエンディアン)
+        return g.ToString("N").ToUpperInvariant() + age.ToString("X");
     }
 
     private void SearchStore(string root, List<ShaderSymbolKey> pending, string by)

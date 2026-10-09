@@ -107,7 +107,7 @@ cd .. && dotnet publish src/gcap -c Release -o dist && python -m unittest discov
 残課題:
 1. PIX 独自レコードの未解明部分（❓）の解明（[wpix.md §5](docs/formats/wpix.md)）
 2. 未検証の引数種別（ExecuteIndirect の VB/IB/CBV 引数、フレーム内 BLAS ビルド、WorkGraphs など）
-3. PIX のシンボルサーバ問い合わせ形式との一致確認
+3. PIX の GUI でシンボルストアからシェーダソースが表示されるかの確認（ストアの索引は symsrv 標準形式で検証済み）
 4. 他プラットフォーム（Nsight Graphics は NVIDIA GPU 環境が必要。[解析手順書](docs/reverse-engineering-guide.md) §9）
 
 ## 必要環境

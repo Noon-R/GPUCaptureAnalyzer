@@ -9,6 +9,8 @@ from __future__ import annotations
 import functools
 import json
 import shutil
+import struct
+import uuid
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,22 @@ from test_csharp_parity import EXE  # noqa: E402
 
 CAPTURE = ROOT / "captures" / "pix_dxil" / "v0.wpix"
 PDB_DIR = ROOT / "bin" / "shaders" / "pdb"
+
+
+def symstore_index(pdb: Path) -> str:
+    """PDB info stream (MSF stream 1: u32 ver, u32 sig, u32 age, GUID) から symstore の索引文字列を作る。
+    symsrv.dll の SymbolServerGetIndexStringW と同じ結果になることを確認済み (例: 8C50FF3F...373C1)。"""
+    data = pdb.read_bytes()
+    bs, _, _, dirbytes, _, dirmap = struct.unpack_from("<6I", data, 32)
+    nd = (dirbytes + bs - 1) // bs
+    d = b"".join(data[i * bs:(i + 1) * bs] for i in struct.unpack_from(f"<{nd}I", data, dirmap * bs))
+    n = struct.unpack_from("<I", d, 0)[0]
+    sizes = struct.unpack_from(f"<{n}I", d, 4)
+    off = 4 + 4 * n + 4 * ((sizes[0] + bs - 1) // bs if sizes[0] != 0xFFFFFFFF else 0)
+    blk = struct.unpack_from("<I", d, off)[0]   # stream 1 (56 B) は 1 ブロックに収まる
+    _, _, age = struct.unpack_from("<3I", data, blk * bs)
+    guid = uuid.UUID(bytes_le=data[blk * bs + 12:blk * bs + 28])
+    return guid.hex.upper() + format(age, "X")
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
@@ -124,6 +142,29 @@ class TestShaderSymbols(unittest.TestCase):
         self.assertEqual(s[a]["foundBy"], "symbol-server")
         self.assertEqual(s[a]["matchedBy"], "hash(pdbutils)")
         self.assertTrue((cache / a / h / a).exists())   # cache にストア形式で保存される
+
+    def test_symstore_layout(self):
+        """symstore / symsrv 標準の索引 (<name>/<GUID+Age>/<name>) のローカルストアと HTTP サーバから解決できる。"""
+        a, b, _ = self.names()
+        local, http_root = self.tmp / "symstore", self.tmp / "symweb"
+        for root, n in ((local, a), (http_root, b)):
+            idx = symstore_index(self.pdbs[n])
+            self.assertNotEqual(idx, n.removesuffix(".pdb").upper() + "1")   # GUID 書式化で並びが変わる
+            (root / n / idx).mkdir(parents=True)
+            shutil.copy(self.pdbs[n], root / n / idx / n)
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(_QuietHandler, directory=str(http_root)))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            cache = self.tmp / "cache"
+            rep = self.run_shaders("--no-capture-dir", "--symbol-server", str(local),
+                                   "--symbol-server", f"srv*{cache}*http://127.0.0.1:{srv.server_address[1]}")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        s = self.by_name(rep)
+        self.assertEqual((s[a]["foundBy"], s[a]["matchedBy"]), ("symbol-store", "hash(pdbutils)"))
+        self.assertEqual((s[b]["foundBy"], s[b]["matchedBy"]), ("symbol-server", "hash(pdbutils)"))
+        self.assertTrue((cache / b / symstore_index(self.pdbs[b]) / b).exists())
 
     def test_stop_when_all_found(self):
         for n, p in self.pdbs.items():
