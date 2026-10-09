@@ -17,8 +17,12 @@ GUID_SCREENSHOT_PNG = "7c29896a-6790-4b40-ab07-f9876ee0e614"
 
 
 def _filetime(v: int) -> str:
+    # FILETIME (100ns 単位) -> マイクロ秒 (整数演算で偶数丸め。float を経由すると桁落ちする)
+    us, rem = divmod(v, 10)
+    if rem > 5 or (rem == 5 and us % 2 == 1):
+        us += 1
     try:
-        return (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=v / 10)).isoformat()
+        return (datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=us)).isoformat()
     except OverflowError:
         return str(v)
 

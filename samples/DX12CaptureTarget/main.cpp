@@ -6,7 +6,7 @@
 //
 // Usage:
 //   DX12CaptureTarget.exe [--variant N] [--pix-capture out.wpix] [--capture-frame F] [--frames N]
-//                         [--manifest out.json] [--no-pix] [--warp]
+//                         [--manifest out.json] [--no-pix] [--warp] [--dxil]
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -49,6 +49,7 @@ struct Options {
     uint32_t totalFrames = 0;      // 0 = captureFrame + 10
     bool loadPix = true;
     bool warp = false;
+    bool dxil = false;             // dxc でビルドした DXIL (+分離 PDB) を使う
 };
 
 static constexpr UINT kWidth = 320;
@@ -195,57 +196,46 @@ static void PixMarker(ID3D12GraphicsCommandList* cl, const wchar_t* s)
 // ---------------------------------------------------------------------------------------------
 // シェーダ
 // ---------------------------------------------------------------------------------------------
-static const char* kGraphicsHlsl = R"(
-// GCA_GRAPHICS_SHADER_SOURCE_MARKER
-cbuffer SceneCB : register(b0)
-{
-    uint4  gMagic;
-    float4 gFloats;
-};
-cbuffer RootConsts : register(b1)
-{
-    uint4 gRootConsts;
-};
-Texture2D    gTex  : register(t0);
-SamplerState gSamp : register(s0);
 
-struct VSIn  { float3 pos : POSITION; float4 col : COLOR; float2 uv : TEXCOORD0; };
-struct VSOut { float4 pos : SV_Position; float4 col : COLOR; float2 uv : TEXCOORD0; };
 
-VSOut VSMain(VSIn i, uint iid : SV_InstanceID)
+// シェーダは <exe>/shaders/ から読む (CMake がビルド時に配置)
+//   既定 (DXBC): *.hlsl を実行時に D3DCompile (SM5.1)
+//   --dxil     : dxc でビルド済みの *.cso (SM6.0, -Zi -Qstrip_debug, PDB は shaders/pdb/ に分離)
+static std::wstring ShaderDir()
 {
-    VSOut o;
-    o.pos = float4(i.pos.xy * (1.0 - 0.1 * iid) + gFloats.x * 0.0, i.pos.z, 1.0);
-    o.col = i.col;
-    o.uv  = i.uv;
-    return o;
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring s = path;
+    return s.substr(0, s.find_last_of(L"\\/") + 1) + L"shaders\\";
 }
 
-float4 PSMain(VSOut i) : SV_Target
+static std::vector<char> ReadFileBytes(const std::wstring& path)
 {
-    float4 t = gTex.Sample(gSamp, i.uv);
-    float  k = (gMagic.x & 1) ? 1.0 : 0.5;
-    return i.col * t * k + float4((gRootConsts.x & 0xFF) / 255.0, 0, 0, 0);
+    std::vector<char> data;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) throw std::runtime_error("cannot open shader file");
+    fseek(f, 0, SEEK_END);
+    data.resize((size_t)ftell(f));
+    fseek(f, 0, SEEK_SET);
+    fread(data.data(), 1, data.size(), f);
+    fclose(f);
+    return data;
 }
-)";
 
-static const char* kComputeHlsl = R"(
-// GCA_COMPUTE_SHADER_SOURCE_MARKER
-RWStructuredBuffer<uint> gOut : register(u0);
-cbuffer RootConsts : register(b0) { uint4 gRootConsts; };
-
-[numthreads(8, 1, 1)]
-void CSMain(uint3 id : SV_DispatchThreadID)
+static ComPtr<ID3DBlob> LoadCso(const wchar_t* name)
 {
-    if (id.x < 64)
-        gOut[id.x] = gRootConsts.x ^ (id.x * 0x01010101u) ^ id.y;
+    auto bytes = ReadFileBytes(ShaderDir() + name);
+    ComPtr<ID3DBlob> blob;
+    CHECK(D3DCreateBlob(bytes.size(), &blob));
+    memcpy(blob->GetBufferPointer(), bytes.data(), bytes.size());
+    return blob;
 }
-)";
 
-static ComPtr<ID3DBlob> Compile(const char* src, const char* entry, const char* target)
+static ComPtr<ID3DBlob> Compile(const wchar_t* file, const char* entry, const char* target)
 {
+    auto src = ReadFileBytes(ShaderDir() + file);
     ComPtr<ID3DBlob> code, err;
-    HRESULT hr = D3DCompile(src, strlen(src), "gca_shader.hlsl", nullptr, nullptr, entry, target,
+    HRESULT hr = D3DCompile(src.data(), src.size(), "gca_shader.hlsl", nullptr, nullptr, entry, target,
                             D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &err);
     if (FAILED(hr)) {
         if (err) printf("%s\n", (const char*)err->GetBufferPointer());
@@ -728,9 +718,16 @@ void App::CreatePipelines()
     csRootSig_->SetName(L"GCA_ComputeRootSig");
 
     // --- PSOs ---
-    auto vs = Compile(kGraphicsHlsl, "VSMain", "vs_5_1");
-    auto ps = Compile(kGraphicsHlsl, "PSMain", "ps_5_1");
-    auto cs = Compile(kComputeHlsl, "CSMain", "cs_5_1");
+    ComPtr<ID3DBlob> vs, ps, cs;
+    if (opt_.dxil) {
+        vs = LoadCso(L"vs.cso");
+        ps = LoadCso(L"ps.cso");
+        cs = LoadCso(L"cs.cso");
+    } else {
+        vs = Compile(L"graphics.hlsl", "VSMain", "vs_5_1");
+        ps = Compile(L"graphics.hlsl", "PSMain", "ps_5_1");
+        cs = Compile(L"compute.hlsl", "CSMain", "cs_5_1");
+    }
 
     D3D12_INPUT_ELEMENT_DESC layout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -969,6 +966,7 @@ static Options ParseArgs()
         else if (a == L"--frames") o.totalFrames = (uint32_t)_wtoi(next().c_str());
         else if (a == L"--no-pix") o.loadPix = false;
         else if (a == L"--warp") o.warp = true;
+        else if (a == L"--dxil") o.dxil = true;
     }
     LocalFree(argv);
     if (o.totalFrames == 0) o.totalFrames = o.captureFrame + 10;

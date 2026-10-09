@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from gcap.__main__ import main as py_main  # noqa: E402
 
 CAP_DIR = ROOT / "captures" / "pix"
-CAPTURES = sorted(CAP_DIR.glob("v*.wpix"))
+CAPTURES = sorted(CAP_DIR.glob("v*.wpix")) + sorted((ROOT / "captures" / "pix_dxil").glob("v*.wpix"))
 
 
 def find_exe() -> Path | None:

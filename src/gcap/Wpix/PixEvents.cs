@@ -15,11 +15,12 @@ public static class PixEvents
 
     private static string Hex(long v) => $"0x{v:x}";
 
-    /// <summary>Python の datetime(1601,1,1,UTC)+timedelta(microseconds=v/10) の isoformat と同じ文字列。</summary>
+    /// <summary>FILETIME を ISO 8601 (Python 版の isoformat と同じ形式) にする。</summary>
     public static string FileTime(ulong v)
     {
-        double usF = v / 10.0;
-        long us = (long)Math.Round(usF, MidpointRounding.ToEven);
+        // 100ns 単位 -> マイクロ秒 (整数演算で偶数丸め)
+        long us = (long)(v / 10), rem = (long)(v % 10);
+        if (rem > 5 || (rem == 5 && us % 2 == 1)) us++;
         var t = new DateTime(1601, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddTicks(us * 10);
         var frac = us % 1_000_000;
         return t.ToString("yyyy-MM-dd'T'HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture) +

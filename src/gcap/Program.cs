@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using Gcap.Meta;
+using Gcap.Shaders;
 using Gcap.Util;
 using Gcap.Wpix;
 
@@ -18,6 +19,14 @@ public static class Program
           gcap wpix objects  <capture.wpix>
           gcap wpix draws    <capture.wpix> [--json]
           gcap wpix extract  <capture.wpix> -o <outdir>
+          gcap wpix shaders  <capture.wpix> -o <outdir> [--symbols <dir>]... [--symbol-server <spec>]...
+                             [--no-capture-dir] [--il-all] [-v]
+              シェーダを書き出し PDB を探索・照合する。探索順 (必要分が揃った時点で打ち切り):
+                1. キャプチャと同じフォルダ以下 (再帰, --no-capture-dir で無効)
+                2. --symbols で指定したフォルダ以下 (再帰)
+                3. --symbol-server / 環境変数 GCAP_SYMBOL_PATH (';' 区切り)
+                   srv*<cache>*<https://url> | <https://url> | <ローカルのシンボルストア>
+              見つからないシェーダは IL (DXIL/DXBC の逆アセンブル) で書き出す
           gcap meta rebuild  [--sdk <Windows Kits Include\<ver> dir>]
 
         Global options:
@@ -52,6 +61,23 @@ public static class Program
                 case "cmdlists": CmdLists(Capture.Open(file, dec)); break;
                 case "objects": Objects(Capture.Open(file, dec)); break;
                 case "draws": Draws(Capture.Open(file, dec), args.Has("--json")); break;
+                case "shaders":
+                {
+                    var servers = args.Values("--symbol-server").ToList();
+                    var envPath = Environment.GetEnvironmentVariable("GCAP_SYMBOL_PATH");
+                    if (!string.IsNullOrEmpty(envPath)) servers.AddRange(envPath.Split(';', StringSplitOptions.RemoveEmptyEntries));
+                    var summary = ShaderExporter.Export(Capture.Open(file, dec), new ShaderExportOptions
+                    {
+                        OutDir = args.Value("-o") ?? args.Value("--output") ?? throw new ArgumentException("-o <outdir> required"),
+                        SearchCaptureDir = !args.Has("--no-capture-dir"),
+                        Folders = args.Values("--symbols").ToList(),
+                        SymbolServers = servers,
+                        IlForAll = args.Has("--il-all"),
+                        Verbose = args.Has("-v") || args.Has("--verbose"),
+                    });
+                    PrintShaderSummary(summary);
+                    break;
+                }
                 case "extract":
                     Extract(Capture.Open(file, dec), args.Value("-o") ?? args.Value("--output") ?? throw new ArgumentException("-o <outdir> required"));
                     break;
@@ -294,14 +320,31 @@ public static class Program
         Console.WriteLine($"extracted {resources.Count} resources, {shaders.Count} shader blobs, {blobs.Count} blobs -> {outDir}");
     }
 
+    private static void PrintShaderSummary(Obj s)
+    {
+        Console.WriteLine($"shaders: {s.Get("resolved")}/{s.Get("total")} resolved  (dxcompiler: {s.Get("dxcompiler") ?? "not found"})");
+        foreach (var r in s.GetList("shaders")!.OfType<Obj>())
+        {
+            var uses = string.Join(",", r.GetList("uses")!.OfType<Obj>().Select(u => $"{u.Get("pso")}:{u.Get("stage")}"));
+            var state = r.Get("resolved") is true
+                ? $"PDB {r.Get("foundBy")} [{r.Get("matchedBy")}] {r.Get("pdbSource")}"
+                : (r.Get("il") is string il ? $"NOT FOUND -> IL {il}" : "NOT FOUND (no disassembler)");
+            Console.WriteLine($"  {r.Get("file"),-40} {r.Get("debugName") ?? r.Get("hash") ?? "-",-40} {uses}");
+            Console.WriteLine($"      {state}");
+        }
+        Console.WriteLine($"  report: shaders.json  (files examined: {s.GetObj("searched")?.Get("filesExamined")})");
+    }
+
     private static int IndexOf(ReadOnlySpan<byte> hay, ReadOnlySpan<byte> needle) => hay.IndexOf(needle);
 
     /// <summary>最小限の引数パーサ: 位置引数と --flag / --key value。</summary>
     private sealed class Args
     {
-        private static readonly HashSet<string> Valued = ["--meta", "--type-bases", "--sdk", "-o", "--output"];
+        private static readonly HashSet<string> Valued =
+            ["--meta", "--type-bases", "--sdk", "-o", "--output", "--symbols", "--symbol-server"];
         private readonly List<string> _pos = [];
         private readonly Dictionary<string, string?> _opt = [];
+        private readonly Dictionary<string, List<string>> _multi = [];
 
         public Args(string[] argv)
         {
@@ -310,7 +353,13 @@ public static class Program
                 var a = argv[i];
                 if (a.StartsWith('-') && a.Length > 1)
                 {
-                    if (Valued.Contains(a)) _opt[a] = i + 1 < argv.Length ? argv[++i] : throw new ArgumentException($"{a} requires a value");
+                    if (Valued.Contains(a))
+                    {
+                        var v = i + 1 < argv.Length ? argv[++i] : throw new ArgumentException($"{a} requires a value");
+                        _opt[a] = v;
+                        if (!_multi.TryGetValue(a, out var l)) _multi[a] = l = [];
+                        l.Add(v);
+                    }
                     else _opt[a] = null;
                 }
                 else _pos.Add(a);
@@ -320,5 +369,6 @@ public static class Program
         public string? Positional(int i) => i < _pos.Count ? _pos[i] : null;
         public bool Has(string k) => _opt.ContainsKey(k);
         public string? Value(string k) => _opt.GetValueOrDefault(k);
+        public IEnumerable<string> Values(string k) => _multi.TryGetValue(k, out var l) ? l : [];
     }
 }

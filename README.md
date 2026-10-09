@@ -15,6 +15,9 @@ PIX などの GUI/CLI では取り出しにくい情報を自動解析できる�
 - **Draw/Dispatch 毎のバインディング解決**（ルートシグネチャ blob を解析し、ディスクリプタテーブル → 実リソース、VB/IB、RTV/DSV を特定）
 - キャプチャ開始時点のリソース内容・ステート・ディスクリプタヒープのスナップショット
 - リソース初期データ / シェーダバイトコード / ルートシグネチャ / スクリーンショットの抽出
+- **シェーダシンボル（PDB）の探索と照合**: キャプチャと同じフォルダ / 指定フォルダ / シンボルサーバを再帰探索し、
+  シェーダハッシュで照合（必要分が揃った時点で打ち切り）。PDB から HLSL ソースとコンパイル引数を取り出し、
+  見つからないシェーダは IL（DXIL/DXBC 逆アセンブル）で書き出す → [docs/shader-symbols.md](docs/shader-symbols.md)
 - 未知形式向けのバイナリ調査ツール（Python 版のみ: エントロピー、タグ、既知値検索、圧縮総当たり）
 
 **解析手順書（他プラットフォームにも適用可）: [docs/reverse-engineering-guide.md](docs/reverse-engineering-guide.md)**
@@ -34,6 +37,8 @@ gcap wpix cmdlists capture.wpix              # コマンドリスト毎・マー
 gcap wpix objects  capture.wpix              # オブジェクト一覧 (名前・型・リソース desc)
 gcap wpix draws    capture.wpix [--json]     # Draw/Dispatch 毎の PSO・ルート引数・実リソース
 gcap wpix extract  capture.wpix -o outdir    # リソース初期データ/シェーダ/ルートシグネチャ/スクリーンショット
+gcap wpix shaders  capture.wpix -o outdir [--symbols dir]... [--symbol-server srv*cache*https://...]... [--il-all] [-v]
+                                             # シェーダ + PDB 照合 (HLSL ソース取り出し) / 未発見は IL
 gcap meta rebuild                            # Windows SDK ヘッダから型メタデータを再生成
 ```
 
@@ -52,6 +57,7 @@ samples/DX12CaptureTarget/   既知の値を埋め込んだ DX12 テストアプ
 scripts/capture_pix.py       variant 毎にキャプチャ + pixtool で正解データ (event list / export-to-cpp) を生成
 tests/test_wpix.py           Python 版: manifest 照合 + export-to-cpp 照合
 tests/test_csharp_parity.py  C# 版 == Python 版 (calls / draws / extract の出力一致)
+tests/test_shader_symbols.py シェーダ PDB 探索 (キャプチャフォルダ/指定フォルダ/ストア/HTTP/打ち切り/古い PDB の除外/IL)
 docs/                        フォーマット仕様・手法
 captures/                    キャプチャ置き場 (git 管理外)
 ```
@@ -65,6 +71,8 @@ cmake --build samples/DX12CaptureTarget/build --config Release
 
 # キャプチャ取得 (variant 0..3) + pixtool による正解データ生成
 python scripts/capture_pix.py --variants 0 1 2 3
+# DXIL シェーダ (dxc -Zi -Qstrip_debug, PDB は bin/shaders/pdb/ に分離) 版: シンボル照合のテスト用
+python scripts/capture_pix.py --variants 0 1 --out captures/pix_dxil --app-args --dxil
 
 # 解析作業用 (Python)
 cd tools
@@ -88,8 +96,7 @@ cd .. && dotnet publish src/gcap -c Release -o dist && python -m unittest discov
 
 当面は PIX (.wpix) の対応範囲を広げる。Nsight Graphics は NVIDIA GPU 環境の用意後に着手する。
 
-1. **シェーダシンボル**: シンボルサーバ / キャプチャと同じフォルダ / 指定フォルダを再帰探索して PDB を照合
-   （必要分が見つかった時点で打ち切り）。見つからないシェーダは IL（DXIL/DXBC 逆アセンブル）で書き出す
+1. ~~シェーダシンボル（PDB 探索・照合、IL 書き出し）~~ 対応済み。PIX の公式シンボルサーバ形式との一致確認が残課題
 2. ExecuteIndirect / CommandSignature、Enhanced Barriers (`Barrier`)、RenderPass
 3. PipelineStateStream (`CreatePipelineState`)、Placed / Reserved リソース、CopyDescriptors
 4. 複数キュー（Copy / Compute）・複数コマンドリスト・Bundle・Query

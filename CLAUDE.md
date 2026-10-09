@@ -21,6 +21,11 @@ GPU キャプチャ (PIX .wpix / 将来 Nsight Graphics) のバイナリを独�
 6. `dotnet publish src/gcap -c Release -o dist` → `python -m unittest discover -s tests -v`（manifest 照合 + export-to-cpp 照合 + C#/Python 出力一致）
 7. `docs/formats/wpix.md` を確度マーク（✅/🔶/❓）付きで更新
 
+## シェーダシンボル（docs/shader-symbols.md）
+- `gcap wpix shaders` は C# のみ（PDB/DXC の COM を使うため）。検証は `tests/test_shader_symbols.py`（Python から exe を実行）
+- DXIL 版キャプチャ: `python scripts/capture_pix.py --variants 0 1 --out captures/pix_dxil --app-args --dxil`（PDB は `bin/shaders/pdb/`）
+- DXC の COM は vtable スロット番号で呼んでいる（`src/gcap/Shaders/Dxc.cs`）。番号は Windows SDK `um/dxcapi.h` の宣言順
+
 ## 重要な規約・知見
 - デコーダは「ペイロードを過不足なく消費できたか」で正しさを判定する。`ok=False` を握りつぶさない
 - typeId = base[宣言インターフェース] + 自前メソッド順。base は `knowledge/type_bases.json` に追記する
