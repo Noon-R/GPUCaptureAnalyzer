@@ -40,28 +40,64 @@ public sealed class Capture
 
     public List<Call> Failed() => Calls.Where(c => !c.Ok).ToList();
 
-    /// <summary>ExecuteCommandLists を起点に、各コマンドリストの記録 (seq 範囲) を取り出す。</summary>
+    private Dictionary<long, List<Call>>? _listCalls;
+
+    /// <summary>
+    /// seq >= first で this == listId のコマンドリスト呼び出しを先頭から num 件。
+    /// num は seq の範囲幅ではなく「そのリスト自身のレコード数」(間に Bundle の記録や PIX のスナップショットが挟まる)。
+    /// </summary>
+    private List<Call> ListRecords(long listId, ulong first, ulong num)
+    {
+        if (_listCalls is null)
+        {
+            _listCalls = [];
+            foreach (var c in Calls) // Calls は seq 順
+            {
+                long? owner = null;
+                if (c.Api.StartsWith("ID3D12GraphicsCommandList") && c.This is not null) owner = c.This;
+                else if (c.Api == "PIX::PrepareForPresent") owner = c.Args.GetLong("commandList"); // リストに属する PIX 独自イベント
+                if (owner is null) continue;
+                if (!_listCalls.TryGetValue(owner.Value, out var l)) _listCalls[owner.Value] = l = [];
+                l.Add(c);
+            }
+        }
+        var outp = new List<Call>();
+        foreach (var c in _listCalls.GetValueOrDefault(listId) ?? [])
+        {
+            if (c.Seq < first) continue;
+            outp.Add(c);
+            if ((ulong)outp.Count == num) break;
+        }
+        return outp;
+    }
+
+    /// <summary>ExecuteCommandLists を起点に、各コマンドリストの記録を取り出す。</summary>
     public List<CommandListRecording> CommandLists()
     {
-        var listStreams = Calls.Where(c => c.Api.StartsWith("ID3D12GraphicsCommandList::")).Select(c => c.Stream).ToHashSet();
-        var bySeq = new Dictionary<(ulong, uint), Call>();
-        foreach (var c in Calls) bySeq.TryAdd((c.Seq, c.Stream), c);
         var outp = new List<CommandListRecording>();
         foreach (var ecl in Find("::ExecuteCommandLists"))
         {
             foreach (var lo in ecl.Args.GetList("lists") ?? [])
             {
                 if (lo is not Obj l) continue;
-                ulong first = (ulong)l.GetLong("firstSeq")!, n = (ulong)l.GetLong("numRecords")!;
-                var cmds = new List<Call>();
-                for (ulong s = first; s < first + n; s++)
-                    foreach (var st in listStreams)
-                        if (bySeq.TryGetValue((s, st), out var c)) cmds.Add(c);
-                outp.Add(new CommandListRecording(ecl.Args.GetLong("this"), ecl.Seq, l.GetLong("list") ?? 0, cmds));
+                long list = l.GetLong("list") ?? 0;
+                var cmds = ListRecords(list, (ulong)l.GetLong("firstSeq")!, (ulong)l.GetLong("numRecords")!);
+                outp.Add(new CommandListRecording(ecl.Args.GetLong("this"), ecl.Seq, list, cmds));
             }
         }
         return outp;
     }
+
+    /// <summary>ExecuteBundle が実行する Bundle の記録 (Reset/Close を除く)。</summary>
+    public List<Call> BundleCommands(Call executeBundle)
+    {
+        var info = executeBundle.Args.GetObj("_pix");
+        if (info is null || !info.ContainsKey("list")) return [];
+        return ListRecords(info.GetLong("list") ?? 0, (ulong)info.GetLong("firstSeq")!, (ulong)info.GetLong("numRecords")!)
+            .Where(c => c.Method is not ("Reset" or "Close")).ToList();
+    }
+
+    public Call? CallBySeq(ulong seq, string api) => Calls.FirstOrDefault(c => c.Seq == seq && c.Api == api);
 
     public IEnumerable<(long resource, Obj data)> ResourceInitialData() =>
         Calls.Where(c => c.Api == "PIX::ResourceInitialData" && c.Ok).Select(c => (c.Args.GetLong("resource") ?? 0, c.Args));

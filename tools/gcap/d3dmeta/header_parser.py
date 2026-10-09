@@ -10,6 +10,9 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+# パーサの出力形式を変えたら上げる (キャッシュの自動再生成。C# 版 HeaderDb.MetaVersion と揃える)
+META_VERSION = 2
+
 SDK_INCLUDE_ROOT = Path(r"C:\Program Files (x86)\Windows Kits\10\Include")
 DEFAULT_HEADERS = [
     "um/d3d12.h",
@@ -70,6 +73,7 @@ class HeaderDB:
     # ---- (de)serialize ----
     def to_json(self) -> dict:
         return {
+            "version": META_VERSION,
             "interfaces": {k: asdict(v) for k, v in self.interfaces.items()},
             "structs": {k: asdict(v) for k, v in self.structs.items()},
             "enums": self.enums,
@@ -106,7 +110,7 @@ _RE_VTBL = re.compile(r"typedef struct (\w+)Vtbl\s*\{(.*?)\}\s*\w+Vtbl;", re.S)
 _RE_METHOD = re.compile(
     r"DECLSPEC_XFGVIRT\((\w+),\s*(\w+)\)\s*(.*?)\(\s*STDMETHODCALLTYPE\s*\*\s*(\w+)\s*\)\s*\((.*?)\);", re.S)
 _RE_IID = re.compile(r'MIDL_INTERFACE\("([0-9A-Fa-f-]{36})"\)\s*\n\s*(\w+)\s*:')
-_RE_STRUCT = re.compile(r"typedef struct (\w+)\s*\{(.*?)\}\s*(\w+)\s*;", re.S)
+_RE_STRUCT_HEAD = re.compile(r"typedef struct (\w+)\s*\{")
 _RE_ENUM = re.compile(r"typedef\s+enum\s+(\w+)\s*\{(.*?)\}\s*(\w+)\s*;", re.S)
 _RE_SAL = re.compile(r"(_[A-Z][A-Za-z_]*_(?:\s*\((?:[^()]|\([^()]*\))*\))?)")
 _RE_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
@@ -155,7 +159,9 @@ def _split_params(s: str) -> list[str]:
     return out
 
 
-def _parse_struct_body(body: str) -> list[StructField]:
+def _parse_struct_body(body: str, owner: str = "", synth: dict | None = None) -> list[StructField]:
+    """構造体本体をパースする。union { ... }; (無名) のメンバは同じ union 番号を持つ。
+    struct { ... } Name; (無名 struct の名前付きフィールド) は合成型 "<owner>.<Name>" として synth に登録する。"""
     fields: list[StructField] = []
     union_id = [0]
 
@@ -174,7 +180,12 @@ def _parse_struct_body(body: str) -> list[StructField]:
                     j += 1
                 inner = text[i + m.end(): j - 1]
                 endm = re.match(r"\s*(\w*)\s*;", text[j:])
-                if m.group(1) == "union":
+                fname = endm.group(1) if endm else ""
+                if m.group(1) == "struct" and fname and synth is not None:
+                    tname = f"{owner}.{fname}"
+                    synth[tname] = Struct(tname, _parse_struct_body(inner, tname, synth))
+                    fields.append(StructField(fname, tname, 0, False, "", union))
+                elif m.group(1) == "union":
                     union_id[0] += 1
                     parse_block(inner, union_id[0])
                 else:
@@ -224,10 +235,24 @@ def parse_headers(paths: list[Path]) -> HeaderDB:
                     name, typ, ptr, const, sal, array = _parse_decl(pd)
                     ps.append(Param(name, typ, ptr, const, sal, array))
                 itf.methods.append(Method(mname, declared_in, " ".join(ret.split()), ps))
-        for m in _RE_STRUCT.finditer(src):
-            if m.group(1).endswith("Vtbl") or m.group(3).endswith("Vtbl"):
+        for m in _RE_STRUCT_HEAD.finditer(src):
+            if m.group(1).endswith("Vtbl"):
                 continue
-            db.structs[m.group(3)] = Struct(m.group(3), _parse_struct_body(m.group(2)))
+            # 括弧の対応で本体の終わりを探す (入れ子の struct/union に対応)
+            depth, j = 1, m.end()
+            while depth and j < len(src):
+                if src[j] == "{":
+                    depth += 1
+                elif src[j] == "}":
+                    depth -= 1
+                j += 1
+            tm = re.match(r"\s*(\w+)\s*;", src[j:])
+            if not tm or tm.group(1).endswith("Vtbl"):
+                continue
+            name = tm.group(1)
+            synth: dict[str, Struct] = {}
+            db.structs[name] = Struct(name, _parse_struct_body(src[m.end():j - 1], name, synth))
+            db.structs.update(synth)
         for m in _RE_ENUM.finditer(src):
             vals: dict[str, int] = {}
             cur = -1
@@ -268,7 +293,9 @@ CACHE = Path(__file__).with_name("d3d12_meta.json")
 
 def load_db(rebuild: bool = False) -> HeaderDB:
     if CACHE.exists() and not rebuild:
-        return HeaderDB.from_json(json.loads(CACHE.read_text(encoding="utf-8")))
+        data = json.loads(CACHE.read_text(encoding="utf-8"))
+        if data.get("version") == META_VERSION:
+            return HeaderDB.from_json(data)
     inc = find_sdk_include()
     db = parse_headers([inc / h for h in DEFAULT_HEADERS if (inc / h).exists()])
     CACHE.write_text(json.dumps(db.to_json(), indent=1), encoding="utf-8")

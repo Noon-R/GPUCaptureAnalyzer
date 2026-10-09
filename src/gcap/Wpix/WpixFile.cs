@@ -93,14 +93,19 @@ public sealed class WpixFile
         var name = head[1..];
         if (Tag(end - 4) != name + ">") throw new WpixFormatException($"section {name} end tag mismatch at 0x{end - 4:x}");
         var sec = new Section { Tag = name, Entry = e, Version = U32(start + 4) };
+        // 同じストリーム ID のエントリが複数あることがある (大きいデータ/複数フレーム)。出現順に連結する
+        // (レコードはエントリ境界をまたいで続く)
         foreach (var de in ReadDirTable(end - 0x40, "DIR2"))
         {
-            var st = new WpixStream { Id = de.Id, Entry = de };
+            var st = sec.Streams.FirstOrDefault(x => x.Id == de.Id);
+            if (st is null) sec.Streams.Add(st = new WpixStream { Id = de.Id, Entry = de });
             ParseBlocks(st, (long)de.Offset, (long)(de.Offset + de.Size));
+        }
+        foreach (var st in sec.Streams)
+        {
             using var ms = new MemoryStream();
             foreach (var blk in st.Blocks) ms.Write(DecompressBlock(blk));
             st.Data = ms.ToArray();
-            sec.Streams.Add(st);
         }
         return sec;
     }

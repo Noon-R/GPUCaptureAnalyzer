@@ -88,16 +88,7 @@ def cmd_calls(a) -> None:
 
 
 def _event_text(c) -> str:
-    d = c.args.get("pData")
-    md = c.args.get("Metadata")
-    if isinstance(d, dict) and "hex" in d:
-        raw = bytes.fromhex(d["hex"].rstrip("."))
-        if md == 0:
-            return raw.decode("utf-16-le", "replace").rstrip("\x00")
-        if md == 1:
-            return raw.decode("latin1").rstrip("\x00")
-        return f"<pix3 metadata={md}>"
-    return "?"
+    return c.args.get("_text", "?")
 
 
 def cmd_cmdlists(a) -> None:
@@ -118,8 +109,12 @@ def cmd_cmdlists(a) -> None:
                 if name == "BeginEvent":
                     depth += 1
                 continue
-            args = ", ".join(f"{k}={_short(v, cap)}" for k, v in c.args.items())
+            args = ", ".join(f"{k}={_short(v, cap)}" for k, v in c.args.items() if k != "_pix")
             print(f"{ind}{c.seq:5d} {name}({args})")
+            if name == "ExecuteBundle":
+                for bc in cap.bundle_commands(c):
+                    bargs = ", ".join(f"{k}={_short(v, cap)}" for k, v in bc.args.items() if k != "_pix")
+                    print(f"{ind}    | {bc.seq:5d} {bc.api.split('::')[-1]}({bargs})")
 
 
 def cmd_objects(a) -> None:
@@ -171,7 +166,7 @@ def cmd_extract(a) -> None:
             raw = cap.raw_args(c)
             desc = raw.get("pDesc") or {}
             pso = (raw.get("ppPipelineState") or {}).get("obj")
-            for stage in ("VS", "PS", "DS", "HS", "GS", "CS"):
+            for stage in ("VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS"):
                 sb = desc.get(stage)
                 if isinstance(sb, dict) and isinstance(sb.get("pShaderBytecode"), (bytes, bytearray)):
                     nm = cap.objects.get(pso, {}).get("name") or f"pso{pso}"
@@ -180,6 +175,20 @@ def cmd_extract(a) -> None:
                     p = out / "shaders" / f"{pso:04d}_{nm}_{stage}.{ext}"
                     p.write_bytes(blob)
                     manifest["shaders"].append({"pso": pso, "stage": stage, "file": f"shaders/{p.name}"})
+        if c.api == "PIX::CreateStateObject" and c.ok:
+            # DXR などの StateObject: DXIL ライブラリを書き出す
+            raw = cap.raw_args(c)
+            so = raw.get("ppStateObject") or 0
+            nm = cap.objects.get(so, {}).get("name") or f"so{so}"
+            li = 0
+            for sub in (raw.get("pDesc") or {}).get("pSubobjects") or []:
+                lib = ((sub.get("desc") or {}).get("DXILLibrary") or {}).get("pShaderBytecode")
+                if not isinstance(lib, (bytes, bytearray)):
+                    continue
+                p = out / "shaders" / f"{so:04d}_{nm}_LIB{li}.dxil"
+                li += 1
+                p.write_bytes(bytes(lib))
+                manifest["shaders"].append({"stateObject": so, "stage": "LIB", "file": f"shaders/{p.name}"})
         if c.api.endswith("::CreateRootSignature"):
             raw = cap.raw_args(c)
             rs = (raw.get("ppvRootSignature") or {}).get("obj")
@@ -197,14 +206,20 @@ def cmd_extract(a) -> None:
 def cmd_draws(a) -> None:
     from .wpix.capture import Capture
     from .wpix.state import analyze_draws
-    draws = analyze_draws(Capture.open(a.file))
+    cap = Capture.open(a.file)
+    draws = analyze_draws(cap)
     if a.json:
         print(json.dumps(draws, ensure_ascii=False, indent=1))
         return
     for d in draws:
-        args = ", ".join(f"{k}={v}" for k, v in d["args"].items())
-        print(f"[{d['seq']}] {d['call']}({args})  list={d['commandList']}")
+        args = ", ".join(f"{k}={_short(v, cap)}" for k, v in d["args"].items())
+        where = f"queue={d['queue']} list={d['commandList']}" + (f" bundle={d['bundle']}" if d.get("bundle") else "")
+        print(f"[{d['seq']}] {d['call']}({args})  {where}")
         print(f"    PSO={d['pso']}  RootSig={d['rootSignature']}")
+        if d.get("indirectCommands") is not None:
+            print(f"    indirect: {_short(d['indirectCommands'], cap)}")
+        if d.get("shaderTableExports") is not None:
+            print(f"    shader tables: {d['shaderTableExports']}")
         for b in d["bindings"]:
             head = f"    root[{b['rootParam']}] {b['type']:9s} vis={b['visibility']}"
             if b["type"] == "table":
@@ -219,7 +234,7 @@ def cmd_draws(a) -> None:
             print(f"    IA: {d['topology']} VB={[(v['slot'], v['resource'], v['stride']) for v in d['vertexBuffers']]} "
                   f"IB={(d['indexBuffer'] or {}).get('resource')}")
             print(f"    OM: RTV={[r['resource'] for r in d['renderTargets']]} "
-                  f"DSV={(d['depthStencil'] or {}).get('resource')}")
+                  f"DSV={(d['depthStencil'] or {}).get('resource')}" + ("  (render pass)" if d.get("inRenderPass") else ""))
 
 
 def cmd_probe(a) -> None:

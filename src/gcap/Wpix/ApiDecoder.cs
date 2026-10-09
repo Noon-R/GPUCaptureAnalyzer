@@ -70,6 +70,59 @@ public sealed partial class ApiDecoder
         }),
         ["D3D12_VERSIONED_ROOT_SIGNATURE_DESC"] = ("Version", new() { [1] = "Desc_1_0", [2] = "Desc_1_1", [3] = "Desc_1_2" }),
         ["D3D12_TEXTURE_COPY_LOCATION"] = ("Type", new() { [0] = "SubresourceIndex", [1] = "PlacedFootprint" }),
+        // "" = union のメンバを書かない (その判別値では union が空)
+        ["D3D12_BARRIER_GROUP"] = ("Type", new() { [0] = "pGlobalBarriers", [1] = "pTextureBarriers", [2] = "pBufferBarriers" }),
+        ["D3D12_INDIRECT_ARGUMENT_DESC"] = ("Type", new()
+        {
+            [0] = "", [1] = "", [2] = "", [3] = "VertexBuffer", [4] = "", [5] = "Constant", [6] = "ConstantBufferView",
+            [7] = "ShaderResourceView", [8] = "UnorderedAccessView", [9] = "", [10] = "", [11] = "IncrementingConstant",
+        }),
+        ["D3D12_RENDER_PASS_BEGINNING_ACCESS"] = ("Type", new()
+        {
+            [0] = "", [1] = "", [2] = "Clear", [3] = "", [4] = "PreserveLocal", [5] = "PreserveLocal", [6] = "PreserveLocal",
+        }),
+        ["D3D12_RENDER_PASS_ENDING_ACCESS"] = ("Type", new()
+        {
+            [0] = "", [1] = "", [2] = "Resolve", [3] = "", [4] = "PreserveLocal", [5] = "PreserveLocal", [6] = "PreserveLocal",
+        }),
+        ["D3D12_RAYTRACING_GEOMETRY_DESC"] = ("Type", new() { [0] = "Triangles", [1] = "AABBs", [2] = "OmmTriangles" }),
+    };
+
+    // 構造体内の CPU ディスクリプタハンドル (owner, field) -> 種別
+    private static readonly Dictionary<(string, string), string> CpuHandleKindByField = new()
+    {
+        [("D3D12_RENDER_PASS_RENDER_TARGET_DESC", "cpuDescriptor")] = "RTV",
+        [("D3D12_RENDER_PASS_DEPTH_STENCIL_DESC", "cpuDescriptor")] = "DSV",
+    };
+
+    // RenderPass の ClearValue は Format が深度なら DepthStencil、それ以外は Color だけが書かれる
+    private static readonly HashSet<string> DepthFormats =
+    [
+        "DXGI_FORMAT_D32_FLOAT_S8X24_UINT", "DXGI_FORMAT_D32_FLOAT", "DXGI_FORMAT_D24_UNORM_S8_UINT", "DXGI_FORMAT_D16_UNORM",
+    ];
+
+    // PIX が API 引数の後ろに付け足す情報 (参照するスナップショットレコードの seq 等)。args["_pix"] に入る
+    private static readonly Dictionary<string, Func<ByteReader, Obj>> MethodTrailers = new()
+    {
+        ["ExecuteIndirect"] = r => new Obj { ["argumentsSeq"] = r.U64() },               // -> PIX::IndirectArguments
+        ["DispatchRays"] = r => new Obj { ["shaderTablesSeq"] = r.U64() },               // -> PIX::ShaderTables
+        ["BuildRaytracingAccelerationStructure"] = r => new Obj { ["instanceDescsSeq"] = r.U64() }, // -> PIX::InstanceDescs
+        ["ResolveQueryData"] = r =>                                                      // -> PIX::QueryResults
+        {
+            if (!r.Flag()) return new Obj();
+            ulong seq = r.U64();
+            ulong n = r.U64();
+            var vals = new List<object?>();
+            for (ulong i = 0; i < n; i++) vals.Add(r.U64());
+            return new Obj { ["resultSeq"] = seq, ["values"] = vals };
+        },
+        ["ExecuteBundle"] = r =>
+        {
+            long list = r.U32();
+            ulong first = r.U64();
+            ulong num = r.U64();
+            return new Obj { ["list"] = list, ["firstSeq"] = first, ["numRecords"] = num };
+        },
     };
 
     // union の全メンバを (選択せずに) 順に書き出す構造体
@@ -100,6 +153,8 @@ public sealed partial class ApiDecoder
 
     public HeaderDb Db { get; }
     public Dictionary<string, long> Bases { get; }
+    public Dictionary<string, string> Aliases { get; }
+    public long? LastIndirectSignature { get; set; }
     public Dictionary<uint, (string iface, Method method)> TypeMap { get; } = [];
     public Dictionary<uint, (string name, CustomDecoder fn)> Custom { get; } = [];
     public Dictionary<string, string> IidMap { get; }
@@ -109,18 +164,25 @@ public sealed partial class ApiDecoder
     public ApiDecoder(HeaderDb db, string? typeBasesPath = null)
     {
         Db = db;
-        Bases = LoadBases(typeBasesPath);
+        (Bases, Aliases) = LoadKnowledge(typeBasesPath);
         foreach (var (iface, b) in Bases)
         {
             if (iface.StartsWith('_')) continue;
             int i = 0;
             foreach (var m in OwnMethods(iface)) TypeMap[(uint)(b + i++)] = (iface, m);
         }
+        // 規則に従わない ID (PIX が別番号で記録するメソッド)
+        foreach (var (tid, full) in Aliases)
+        {
+            var parts = full.Split("::");
+            var m = OwnMethods(parts[0]).FirstOrDefault(x => x.Name == parts[1]);
+            if (m is not null) TypeMap[uint.Parse(tid)] = (parts[0], m);
+        }
         PixEvents.Register(this);
         IidMap = db.IidToInterface();
     }
 
-    private static Dictionary<string, long> LoadBases(string? path)
+    private static (Dictionary<string, long>, Dictionary<string, string>) LoadKnowledge(string? path)
     {
         JsonDocument doc;
         if (path is not null) doc = JsonDocument.Parse(File.ReadAllBytes(path));
@@ -131,7 +193,10 @@ public sealed partial class ApiDecoder
         }
         var d = new Dictionary<string, long>();
         foreach (var p in doc.RootElement.GetProperty("bases").EnumerateObject()) d[p.Name] = p.Value.GetInt64();
-        return d;
+        var a = new Dictionary<string, string>();
+        if (doc.RootElement.TryGetProperty("aliases", out var al))
+            foreach (var p in al.EnumerateObject()) a[p.Name] = p.Value.GetString()!;
+        return (d, a);
     }
 
     public IEnumerable<Method> OwnMethods(string iface) =>
@@ -256,6 +321,9 @@ public sealed partial class ApiDecoder
 
     public Obj ReadStruct(ByteReader r, string sname)
     {
+        if (sname == "D3D12_RENDER_PASS_BEGINNING_ACCESS_CLEAR_PARAMETERS")
+            return new Obj { ["ClearValue"] = ReadClearValueSelected(r) };
+        if (sname == "D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS") return ReadBuildInputs(r);
         var st = Db.Structs[sname];
         var o = new Obj();
         UnionSelectors.TryGetValue(sname, out var sel);
@@ -276,6 +344,11 @@ public sealed partial class ApiDecoder
                 }
                 if (discV is null || !sel.members.TryGetValue(discV.Value, out var member))
                     throw new DecodeException($"{sname}: unknown union selector {disc}");
+                if (member.Length == 0)
+                {
+                    unionDone.Add(f.Union);
+                    continue;
+                }
                 if (f.Name != member)
                 {
                     f = st.Fields.FirstOrDefault(x => x.Union == f0.Union && x.Name == member)
@@ -283,10 +356,46 @@ public sealed partial class ApiDecoder
                 }
                 unionDone.Add(f.Union);
             }
+            if (CpuHandleKindByField.TryGetValue((sname, f.Name), out var ck)) _cpuKind = ck;
             o[f.Name] = ReadField(r, f.Type, f.Ptr, f.Array, sname, f.Name);
         }
         return o;
     }
+
+    /// <summary>RenderPass の D3D12_CLEAR_VALUE: Format が深度なら DepthStencil、それ以外は Color のみ。</summary>
+    private Obj ReadClearValueSelected(ByteReader r)
+    {
+        var fmt = ReadType(r, "DXGI_FORMAT");
+        if (fmt is string fs && DepthFormats.Contains(fs))
+            return new Obj { ["Format"] = fmt, ["DepthStencil"] = ReadType(r, "D3D12_DEPTH_STENCIL_VALUE") };
+        return new Obj { ["Format"] = fmt, ["Color"] = ReadFieldPublic(r, "FLOAT", 0, "4", "D3D12_CLEAR_VALUE", "Color") };
+    }
+
+    /// <summary>BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS: union は Type (TOP=InstanceDescs) と DescsLayout で選択。</summary>
+    private Obj ReadBuildInputs(ByteReader r)
+    {
+        var o = new Obj
+        {
+            ["Type"] = ReadType(r, "D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE"),
+            ["Flags"] = ReadType(r, "D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS"),
+            ["NumDescs"] = ReadType(r, "UINT"),
+            ["DescsLayout"] = ReadType(r, "D3D12_ELEMENTS_LAYOUT"),
+        };
+        var t = o.Get("Type");
+        if (t is "D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL" || V.ToLong(t) == 0)
+        {
+            o["InstanceDescs"] = ReadType(r, "D3D12_GPU_VIRTUAL_ADDRESS");
+            o["unk?"] = r.U64();   // TOP_LEVEL では union の後ろに 8 バイト (0 を観測)
+        }
+        else if (o.Get("DescsLayout") is "D3D12_ELEMENTS_LAYOUT_ARRAY" || V.ToLong(o.Get("DescsLayout")) == 0)
+            o["pGeometryDescs"] = ReadFieldPublic(r, "D3D12_RAYTRACING_GEOMETRY_DESC", 1, "", "INPUTS", "pGeometryDescs");
+        else
+            o["ppGeometryDescs"] = ReadFieldPublic(r, "D3D12_RAYTRACING_GEOMETRY_DESC", 1, "", "INPUTS", "ppGeometryDescs");
+        return o;
+    }
+
+    public object? ReadFieldPublic(ByteReader r, string t, int ptr, string array, string owner, string name) =>
+        ReadField(r, t, ptr, array, owner, name);
 
     private object? ReadField(ByteReader r, string t, int ptr, string array, string owner, string name)
     {
@@ -393,6 +502,7 @@ public sealed partial class ApiDecoder
                 call.This = r.U32();
                 if (tm.method.Ret == "HRESULT") call.Hr = r.U32();
                 foreach (var p in tm.method.Params) call.Args[p.Name] = ReadParam(r, p, tm.method.Name);
+                if (MethodTrailers.TryGetValue(tm.method.Name, out var trailer)) call.Args["_pix"] = trailer(r);
                 PostProcess(call, tm.method);
             }
             else throw new DecodeException("unknown type id");
@@ -422,7 +532,38 @@ public sealed partial class ApiDecoder
                 NoteObject(o.GetLong("obj"), ("interface", IidMap.GetValueOrDefault(riid, riid)),
                            ("created_by", call.Api), ("seq", call.Seq));
         }
+        if (m.Name is "BeginEvent" or "SetMarker" && call.Args.Get("pData") is byte[] pd)
+            call.Args["_text"] = PixEventText(call.Args.GetLong("Metadata"), pd);
         if (m.Name == "SetName" && call.This is not null) NoteObject(call.This, ("name", call.Args.Get("Name")));
+        if (m.Name == "CreateCommandSignature") NoteObject(call.Args.ObjId("ppvCommandSignature"), ("desc", call.Args.Get("pDesc")));
+        if (m.Name == "ExecuteIndirect") LastIndirectSignature = call.Args.ObjId("pCommandSignature");
+    }
+}
+
+public sealed partial class ApiDecoder
+{
+    /// <summary>
+    /// BeginEvent/SetMarker の pData を文字列化する。Metadata 0 = UTF-16, 1 = ANSI, 2 = PIX3 blob
+    /// (UINT64[]: eventInfo, color, stringInfo (isANSI = bit 54), 文字列)。
+    /// </summary>
+    public static string PixEventText(long? metadata, byte[] data)
+    {
+        static string Cut(string s) { int i = s.IndexOf('\0'); return i >= 0 ? s[..i] : s; }
+        switch (metadata)
+        {
+            case 0: return Cut(System.Text.Encoding.Unicode.GetString(data));
+            case 1: return Cut(System.Text.Encoding.Latin1.GetString(data));
+            case 2 when data.Length >= 24:
+                ulong info = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(data.AsSpan(16));
+                var body = data.AsSpan(24);
+                if (((info >> 54) & 1) != 0)
+                {
+                    int z = body.IndexOf((byte)0);
+                    return System.Text.Encoding.Latin1.GetString(z >= 0 ? body[..z] : body);
+                }
+                return Cut(System.Text.Encoding.Unicode.GetString(body));
+            default: return $"<metadata={(metadata?.ToString() ?? "None")}>";
+        }
     }
 }
 

@@ -38,7 +38,13 @@ class TestShaderSymbols(unittest.TestCase):
         self.cap_dir.mkdir()
         self.cap = self.cap_dir / "frame.wpix"
         shutil.copy(CAPTURE, self.cap)
-        self.pdbs = {p.name: p for p in PDB_DIR.glob("*.pdb")}
+        # キャプチャ内のシェーダのデバッグ名 (= PDB ファイル名) に対応する PDB だけを使う
+        probe = self.tmp / "probe"
+        r = subprocess.run([str(EXE), "wpix", "shaders", str(self.cap), "-o", str(probe), "--no-capture-dir"],
+                           capture_output=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr.decode(errors="replace"))
+        wanted = {x["debugName"] for x in json.loads((probe / "shaders.json").read_text("utf-8"))["shaders"]}
+        self.pdbs = {p.name: p for p in PDB_DIR.glob("*.pdb") if p.name in wanted}
         self.assertEqual(len(self.pdbs), 3)
 
     def tearDown(self):

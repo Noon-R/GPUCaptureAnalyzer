@@ -6,7 +6,7 @@
 //
 // Usage:
 //   DX12CaptureTarget.exe [--variant N] [--pix-capture out.wpix] [--capture-frame F] [--frames N]
-//                         [--manifest out.json] [--no-pix] [--warp] [--dxil]
+//                         [--manifest out.json] [--no-pix] [--warp] [--dxil] [--extras] [--capture-count N]
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -17,12 +17,15 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include "extras.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <string>
 #include <vector>
+#include <memory>
 #include <stdexcept>
 
 using Microsoft::WRL::ComPtr;
@@ -50,6 +53,8 @@ struct Options {
     bool loadPix = true;
     bool warp = false;
     bool dxil = false;             // dxc でビルドした DXIL (+分離 PDB) を使う
+    bool extras = false;           // 追加機能群 (extras.h) を有効にする
+    uint32_t captureCount = 1;     // CaptureNextFrame でキャプチャするフレーム数
 };
 
 static constexpr UINT kWidth = 320;
@@ -294,6 +299,7 @@ private:
     ComPtr<ID3D12Resource> uavBuffer_, copySrc_, copyDst_;
     ComPtr<ID3D12Resource> uploadScratch_;
     ComPtr<ID3D12Resource> depth_, offscreenRT_, textureCopy_;
+    std::unique_ptr<Extras> extras_;
     D3D12_VERTEX_BUFFER_VIEW vbv_{};
     D3D12_INDEX_BUFFER_VIEW ibv_{};
 };
@@ -765,6 +771,13 @@ void App::Init(HWND hwnd)
     CreateDevice();
     CreatePipelines();
     CreateResources();
+    if (opt_.extras) {
+        extras_ = std::make_unique<Extras>();
+        CHECK(allocators_[0]->Reset());
+        CHECK(cmdList_->Reset(allocators_[0].Get(), nullptr));
+        extras_->Init(device_.Get(), queue_.Get(), cmdList_.Get(), opt_.variant, ShaderDir());
+        ExecuteAndWait();
+    }
 }
 
 void App::RenderFrame(uint32_t frameIndex)
@@ -859,9 +872,11 @@ void App::RenderFrame(uint32_t frameIndex)
         cl->ResourceBarrier(1, &b);
     }
     PixEnd(cl);
+    if (extras_) extras_->Record(cl);
     PixEnd(cl);
 
     CHECK(cl->Close());
+    if (extras_) extras_->SubmitAsync(queue_.Get());
     ID3D12CommandList* lists[] = {cl};
     queue_->ExecuteCommandLists(1, lists);
     CHECK(swapchain_->Present(1, 0));
@@ -932,6 +947,8 @@ void App::WriteManifest() const
          "\"GCA_CopySource\", \"GCA_CopyDest\", \"GCA_GraphicsRootSig\", \"GCA_ComputeRootSig\", "
          "\"GCA_GraphicsPSO\", \"GCA_ComputePSO\", \"GCA_SamplerHeap\", \"GCA_DsvHeap\", \"GCA_CpuUavHeap\", "
          "\"GCA_Depth\", \"GCA_OffscreenRT\", \"GCA_TextureCopy\"],\n";
+    if (extras_) s += "  \"extras\": " + extras_->ManifestJson() + ",\n";
+    sprintf_s(buf, "  \"captureCount\": %u,\n", opt_.captureCount); s += buf;
     sprintf_s(buf, "  \"width\": %u,\n  \"height\": %u\n", kWidth, kHeight); s += buf;
     s += "}\n";
     FILE* f = nullptr;
@@ -967,6 +984,8 @@ static Options ParseArgs()
         else if (a == L"--no-pix") o.loadPix = false;
         else if (a == L"--warp") o.warp = true;
         else if (a == L"--dxil") o.dxil = true;
+        else if (a == L"--extras") o.extras = true;
+        else if (a == L"--capture-count") o.captureCount = (uint32_t)_wtoi(next().c_str());
     }
     LocalFree(argv);
     if (o.totalFrames == 0) o.totalFrames = o.captureFrame + 10;
@@ -1008,7 +1027,7 @@ int wmain()
             if (quit) break;
             if (f == opt.captureFrame && !opt.pixCapturePath.empty()) {
                 if (g_captureNextFrame) {
-                    HRESULT hr = g_captureNextFrame(opt.pixCapturePath.c_str(), 1);
+                    HRESULT hr = g_captureNextFrame(opt.pixCapturePath.c_str(), opt.captureCount);
                     wprintf(L"[pix] CaptureNextFrame(%s) hr=0x%08X\n", opt.pixCapturePath.c_str(), (unsigned)hr);
                     captureRequested = SUCCEEDED(hr);
                 } else {

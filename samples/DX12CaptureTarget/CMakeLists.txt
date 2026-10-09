@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(BIN_DIR "${CMAKE_SOURCE_DIR}/../../bin")
 set(SHADER_OUT "${BIN_DIR}/shaders")
 
-add_executable(DX12CaptureTarget main.cpp)
+add_executable(DX12CaptureTarget main.cpp extras.cpp extras.h)
 target_compile_definitions(DX12CaptureTarget PRIVATE UNICODE _UNICODE)
 target_compile_options(DX12CaptureTarget PRIVATE /W4 /utf-8 /wd4100)
 target_link_libraries(DX12CaptureTarget PRIVATE d3d12 dxgi d3dcompiler shell32)
@@ -25,7 +25,9 @@ find_program(DXC_EXE dxc HINTS "$ENV{WindowsSdkVerBinPath}/x64"
              "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64" REQUIRED)
 set(SHADER_SRC "${CMAKE_SOURCE_DIR}/shaders")
 set(DXIL_OUTPUTS)
-foreach(spec "vs;graphics.hlsl;VSMain;vs_6_0" "ps;graphics.hlsl;PSMain;ps_6_0" "cs;compute.hlsl;CSMain;cs_6_0")
+foreach(spec "vs;graphics.hlsl;VSMain;vs_6_0" "ps;graphics.hlsl;PSMain;ps_6_0" "cs;compute.hlsl;CSMain;cs_6_0"
+             "ext_vs;ext.hlsl;VSMain;vs_6_0" "ext_ps;ext.hlsl;PSMain;ps_6_0" "ext_cs;ext.hlsl;CSMain;cs_6_0"
+             "ext_ms;ext.hlsl;MSMain;ms_6_5" "ext_as;ext.hlsl;ASMain;as_6_5" "ext_ms_amp;ext.hlsl;MSMainAmp;ms_6_5")
     list(GET spec 0 name)
     list(GET spec 1 src)
     list(GET spec 2 entry)
@@ -39,6 +41,15 @@ foreach(spec "vs;graphics.hlsl;VSMain;vs_6_0" "ps;graphics.hlsl;PSMain;ps_6_0" "
         COMMENT "dxc ${name} (${profile})")
     list(APPEND DXIL_OUTPUTS "${SHADER_OUT}/${name}.cso")
 endforeach()
+# DXR ライブラリ (エントリポイントなし)
+add_custom_command(
+    OUTPUT "${SHADER_OUT}/rt_lib.cso"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_OUT}/pdb"
+    COMMAND "${DXC_EXE}" -nologo -T lib_6_3 -Zi -Qstrip_debug
+            -Fo "${SHADER_OUT}/rt_lib.cso" "-Fd" "${SHADER_OUT}/pdb/" "${SHADER_SRC}/rt.hlsl"
+    DEPENDS "${SHADER_SRC}/rt.hlsl"
+    COMMENT "dxc rt_lib (lib_6_3)")
+list(APPEND DXIL_OUTPUTS "${SHADER_OUT}/rt_lib.cso")
 add_custom_target(shaders ALL DEPENDS ${DXIL_OUTPUTS}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SHADER_SRC}/graphics.hlsl" "${SHADER_SRC}/compute.hlsl" "${SHADER_OUT}/")
 add_dependencies(DX12CaptureTarget shaders)

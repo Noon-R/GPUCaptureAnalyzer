@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from gcap.__main__ import main as py_main  # noqa: E402
 
 CAP_DIR = ROOT / "captures" / "pix"
-CAPTURES = sorted(CAP_DIR.glob("v*.wpix")) + sorted((ROOT / "captures" / "pix_dxil").glob("v*.wpix"))
+CAPTURES = [p for d in ("pix", "pix_dxil", "pix_ext", "pix_multi") for p in sorted((ROOT / "captures" / d).glob("v*.wpix"))]
 
 
 def find_exe() -> Path | None:
@@ -74,7 +74,7 @@ def normalize(v):
 class TestCSharpParity(unittest.TestCase):
     def test_calls(self):
         for cap in CAPTURES:
-            with self.subTest(capture=cap.name):
+            with self.subTest(capture=f"{cap.parent.name}/{cap.name}"):
                 cs = [json.loads(line) for line in run_exe("wpix", "calls", str(cap), "--json").splitlines() if line]
                 py = [json.loads(line) for line in run_py("wpix", "calls", str(cap), "--json").splitlines() if line]
                 self.assertEqual(len(cs), len(py))
@@ -83,13 +83,29 @@ class TestCSharpParity(unittest.TestCase):
 
     def test_draws(self):
         for cap in CAPTURES:
-            with self.subTest(capture=cap.name):
+            with self.subTest(capture=f"{cap.parent.name}/{cap.name}"):
                 cs = json.loads(run_exe("wpix", "draws", str(cap), "--json"))
                 py = json.loads(run_py("wpix", "draws", str(cap), "--json"))
                 self.assertEqual(normalize(cs), normalize(py))
 
+    def test_meta(self):
+        """SDK ヘッダから生成する型メタデータが Python 版と一致する。"""
+        with tempfile.TemporaryDirectory() as td:
+            cs_meta = Path(td, "cs_meta.json")
+            run_exe("meta", "rebuild", "--meta", str(cs_meta))
+            from gcap.d3dmeta.header_parser import load_db
+            py = load_db().to_json()
+            cs = json.loads(cs_meta.read_text("utf-8"))
+            for k in ("version", "interfaces", "structs", "enums", "typedefs"):
+                self.assertEqual(cs[k], py[k], k)
+
     def test_extract(self):
-        cap = CAPTURES[0]
+        for cap in CAPTURES:
+            if cap.parent.name in ("pix", "pix_ext"):
+                with self.subTest(capture=f"{cap.parent.name}/{cap.name}"):
+                    self._extract(cap)
+
+    def _extract(self, cap):
         with tempfile.TemporaryDirectory() as td:
             cs_dir, py_dir = Path(td, "cs"), Path(td, "py")
             run_exe("wpix", "extract", str(cap), "-o", str(cs_dir))

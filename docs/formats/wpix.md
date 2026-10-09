@@ -2,8 +2,11 @@
 
 - 対象: **PIX 2603.25** で `WinPixGpuCapturer.dll` の `CaptureNextFrame` により取得した D3D12 GPU キャプチャ
 - 確度: ✅ 確定（複数キャプチャ・既知値・PIX の export-to-cpp で検証済み） / 🔶 推定（整合するが反例テスト未実施） / ❓ 未解明
-- 実装: `tools/gcap/wpix/`（container → events → decoder / pix_events）
-- 検証: `tests/test_wpix.py`（manifest 照合 + export-to-cpp 照合）。加えて独立検証で export-to-cpp の全コマンド・全リソース生成パラメータ・ヒープ全スロット・PSO 全フィールド・`resources.bin` の初期データ（バイト単位）と一致を確認（v0〜v3）
+- 実装: `src/gcap/Wpix/`（C#, 本体）/ `tools/gcap/wpix/`（Python, リファレンス）。両者の出力一致は `tests/test_csharp_parity.py` で検証
+- 検証: `tests/test_wpix.py`（manifest + export-to-cpp 照合）、`tests/test_wpix_ext.py`（拡張 API・複数フレーム）。
+  加えて独立検証で export-to-cpp の全コマンド・全リソース生成パラメータ・ヒープ全スロット・PSO 全フィールド・`resources.bin` の初期データ（バイト単位）と一致を確認（基本シナリオ v0〜v3）
+- 検証済みキャプチャ: 基本 (`captures/pix`)、DXIL シェーダ (`pix_dxil`)、拡張 API (`pix_ext`: Placed/Reserved, Query, ExecuteIndirect,
+  RenderPass, Bundle, PipelineStateStream, Mesh/Amplification, Enhanced Barriers, DXR, Copy/Compute キュー, PIX3 マーカー)、複数フレーム (`pix_multi`)
 
 ---
 
@@ -32,6 +35,8 @@ end-0x400 ファイルトレーラ (0x400 bytes, 末尾 "GFXB" "GFXA")
 
 - 外側: `DIR1` エントリ（id=0）→ `<CAP` セクション。フッタタグは `DIR0`
 - 内側: `DIR3` エントリ（id=ストリーム ID）→ そのストリームのブロック列。フッタタグは `DIR2`
+- **同じストリーム ID の `DIR3` エントリが複数あることがある**（複数フレーム / 大きいデータ）✅。
+  出現順に連結したものがストリーム本体で、**レコードはエントリ境界をまたいで続く**（2 つ目のエントリの先頭はレコード途中から始まる）
 
 ### 1.2 ブロック ✅
 
@@ -51,11 +56,15 @@ end-0x400 ファイルトレーラ (0x400 bytes, 末尾 "GFXB" "GFXA")
 | stream | 内容 |
 |---|---|
 | 2 | D3D12CreateDevice + アダプタ情報 |
-| 3,4,5,7,8,9,10,11,14 | オブジェクト生成（種類別: Queue, GraphicsPSO, ComputePSO, ?, DescriptorHeap, Allocator, CommandList, RootSig, Fence） |
-| 100 / 101 | リソース生成 (1700) / リソース初期内容 (2029) |
+| 3,4,5,6,7,8,9,10,11,12,13,14,15,17 | オブジェクト生成（種類別: Queue, GraphicsPSO, ComputePSO, PipelineStateStream, ?, DescriptorHeap, Allocator, CommandList, RootSig, CommandSignature, QueryHeap, Fence, Heap, StateObject） |
+| 100 / 101 | リソース生成 (1700/1767/1770) / リソース初期内容 (2029) |
+| 102 / 103 | タイルマッピング (2037) / 加速構造データ (2041) |
 | 300 | SetName |
-| 1000 | キュー操作 (ExecuteCommandLists, Signal, Wait, Present) |
-| 1001 | コマンドリストの記録（全コマンドリスト共通） |
+| 1000 | キュー操作 (ExecuteCommandLists, Signal, Wait, UpdateTileMappings, Present) |
+| 1001 | コマンドリストの記録（direct/compute/copy 全コマンドリスト共通） |
+| 1002 | Bundle の記録 |
+| 2000 | コマンド実行時のスナップショット（間接引数, シェーダテーブル, TLAS インスタンス, Query 結果） |
+| 2001 | ExecuteCommandLists に付随する ❓ (2139) |
 | 10000 / 10001 | 付随 blob の参照 / 本体（スクリーンショット PNG） |
 | 10002 | キャプチャ環境情報 |
 
@@ -96,7 +105,14 @@ typeId = base[宣言インターフェース] + (そのインターフェース�
 | ID3D12GraphicsCommandList | 992 | Close=992, Reset=993, DrawInstanced=995, Dispatch=997, ResourceBarrier=1009, BeginEvent=1040 |
 | ID3D12CommandQueue | 1063 | ExecuteCommandLists=1065, Signal=1069, Wait=1070 |
 | ID3D12Device | 1074 | CreateCommandQueue=1075, CreateRootSignature=1083, CreateFence=1103 |
+| ID3D12Device2 | 1629 | CreatePipelineState=1629（PIX 独自形式。§3.6） |
 | ID3D12Device4 | 1711 | CreateCommandList1=1711 |
+| ID3D12GraphicsCommandList4 | 1919 | BuildRaytracingAccelerationStructure=1923, SetPipelineState1=1926, DispatchRays=1927 |
+| ID3D12GraphicsCommandList6 | 1999 | DispatchMesh=1999 |
+| ID3D12GraphicsCommandList7 | 2081 | Barrier=2081 |
+
+**規則に従わない ID（aliases）**: `BeginRenderPass=1849`, `EndRenderPass=1850`（GCL4 の base からは 1919/1920 になるはずだが PIX は別番号で記録）。
+`type_bases.json` の `aliases` に登録する。
 
 base の間隔はヘッダ上のインターフェース順と完全には一致しない（間に別インターフェースが入る）。
 新しい API を使ったキャプチャで未知 typeId が出たら、`this` の型とペイロード長の完全一致で base を特定して追記する。
@@ -116,6 +132,17 @@ base の間隔はヘッダ上のインターフェース順と完全には一致
 | 2043 | PIX::Unknown2043 | `u32`（0 を観測）❓ |
 | 2044 | PIX::DescriptorHeap | §4.3 |
 | 1065 | ExecuteCommandLists | 汎用規則と異なる独自形式。§3.4 |
+| 1629 | ID3D12Device2::CreatePipelineState | Stream を固定構造に展開した独自形式。§3.6 |
+| 1767 | PIX::CreatePlacedResource | §4.4 |
+| 1770 | PIX::CreateReservedResource | §4.4 |
+| 2030 | PIX::IndirectArguments | ExecuteIndirect 実行時の引数（§4.6） |
+| 2037 | PIX::TileMappings | Reserved リソースのタイルマッピング（`u32 resource` + ❓） |
+| 2038 | PIX::ShaderTables | DispatchRays 実行時のシェーダテーブル（識別子 → エクスポート名）🔶 |
+| 2039 | PIX::InstanceDescs | TLAS ビルド時のインスタンス記述（§4.7） |
+| 2041 | PIX::AccelerationStructureData | 加速構造（BLAS/TLAS）の内容。`u64 ?, u32 resource, u32 size?, u32 ?` + D3D12 シリアライズ形式（ドライバ依存）🔶 |
+| 2045 | PIX::CreateStateObject | §3.7 |
+| 2046 | PIX::QueryResults | ResolveQueryData の結果: `u64 size + bytes`（u64 列） |
+| 2139 | PIX::Unknown2139 | ExecuteCommandLists 後に記録 ❓（4 バイトのハッシュ状の値を含む） |
 
 > ⚠ 2042 にはマシン名・プロセス名・時刻が平文で入る。キャプチャを外部共有する際は注意。
 
@@ -148,6 +175,38 @@ D3D12 API レコードの body は **`u32 this` → (戻り値が HRESULT なら
 | `D3D12_CPU_DESCRIPTOR_HANDLE` | ハンドル値ではなく**ディスクリプタの中身**（§3.2） |
 
 - SAL では単一ポインタだが PIX が配列として書く引数がある: `OMSetRenderTargets.pRenderTargetDescriptors`（`ARRAY_PARAM_OVERRIDES`）。
+- union の選択表（`UNION_SELECTORS`）で `""` は「その判別値では union に何も書かない」を表す
+  （`D3D12_INDIRECT_ARGUMENT_DESC` の DRAW/DISPATCH、`D3D12_RENDER_PASS_BEGINNING_ACCESS` の PRESERVE 等）。
+  `D3D12_BARRIER_GROUP` は Type で `pGlobalBarriers / pTextureBarriers / pBufferBarriers` を選ぶ。
+- **RenderPass の `D3D12_CLEAR_VALUE` は 1700 と違い片方だけ**: Format が深度なら `DepthStencil`、それ以外は `Color[4]` ✅
+- 構造体内の CPU ディスクリプタハンドル（`D3D12_RENDER_PASS_RENDER_TARGET_DESC.cpuDescriptor` → RTV、
+  `D3D12_RENDER_PASS_DEPTH_STENCIL_DESC.cpuDescriptor` → DSV）も §3.2 の形式。
+- `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS`: union は Type（TOP_LEVEL → `InstanceDescs` (GPUVA)）と
+  DescsLayout（ARRAY → `pGeometryDescs` / ARRAY_OF_POINTERS → `ppGeometryDescs`）で選択。TOP_LEVEL では GPUVA の後に `u64 ?`（0）✅
+- union 内の無名 struct（例: `D3D12_INDIRECT_ARGUMENT_DESC` の `Constant`）は、ヘッダパーサが合成型 `<親>.<名前>` として扱う。
+
+### 3.x メソッド末尾の追加データ（PIX が付け足す） ✅
+
+一部の API は引数の後ろに、対応するスナップショットレコードの seq 等が続く（デコード結果では `args["_pix"]`）。
+
+| メソッド | 追加データ |
+|---|---|
+| ExecuteIndirect | `u64 argumentsSeq` → PIX::IndirectArguments (2030) |
+| DispatchRays | `u64 shaderTablesSeq` → PIX::ShaderTables (2038) |
+| BuildRaytracingAccelerationStructure | `u64 instanceDescsSeq` → PIX::InstanceDescs (2039)（TLAS） |
+| ResolveQueryData | `u8 present + u64 resultSeq (→ 2046) + u64 n + u64[n]` |
+| ExecuteBundle | `u32 bundle, u64 firstSeq, u64 numRecords`（ExecuteCommandLists と同じ） |
+
+### 3.y PIX マーカー（BeginEvent / SetMarker の pData） ✅
+
+| Metadata | 内容 |
+|---|---|
+| 0 | UTF-16 文字列（`WINPIX_EVENT_UNICODE_VERSION`） |
+| 1 | ANSI 文字列 |
+| 2 | PIX3 blob（WinPixEventRuntime の `PIXBeginEvent(cmdList, color, "...")`）: `UINT64[]` = `eventInfo`（種別 = bits 10-19: BeginEvent_NoArgs=2, SetMarker_NoArgs=8, VarArgs=1/7）, `color`, `stringInfo`（isANSI = bit 54, copyChunkSize = bits 55-59）, 文字列（8 バイト単位・終端込み）。末尾の BlockEndMarker はサイズに含まれない |
+
+デコード結果では `args["_text"]` に文字列化した値を入れる。サンプルアプリで生成した PIX3 マーカーは PIX 自身も同じ文字列として表示した（エンコードの正しさを確認）。
+`WINPIX_EVENT_PIX3BLOB_V2`（新しい WinPixEventRuntime）の形式は未検証。
 
 ### 3.1 例: ResourceBarrier（41 bytes）
 
@@ -188,8 +247,46 @@ kind=3: u8 present + D3D12_UNORDERED_ACCESS_VIEW_DESC, u32 resource, u32 counter
 u32 queue, u32 NumCommandLists, u64 count,
 { u32 commandList, u64 firstSeq, u64 numRecords } × count
 ```
-`firstSeq .. firstSeq+numRecords-1` がそのコマンドリストの記録（stream 1001 の seq）。
-コマンドリストの記録は Reset から Close までで、ECL から逆引きしてコマンド列を再構成できる。
+コマンドリストの記録は Reset から Close まで。`firstSeq` は先頭（Reset）の seq、
+**`numRecords` は seq の範囲幅ではなく「そのリストに属するレコード数」** ✅
+（間に Bundle の記録 (stream 1002) や実行時スナップショット (stream 2000) が別 seq で挟まるため）。
+再構成は「seq >= firstSeq かつ `this == commandList` のレコードを先頭から numRecords 件」。
+`PIX::PrepareForPresent`（1860, `commandList` フィールドを持つ）もそのリストのレコードに数える。
+
+### 3.5 ExecuteBundle と Bundle ✅
+
+Bundle の Reset〜Close は stream 1002 に記録され、`ExecuteBundle` の追加データ（§3.x）で参照される。
+Bundle はルートシグネチャ等を呼び出し元から継承し、Bundle 内のルート引数変更は呼び出し元に残る（D3D12 の仕様どおり）。
+
+### 3.6 ID3D12Device2::CreatePipelineState（1629, 独自形式） ✅
+
+Stream（サブオブジェクト列）ではなく、PIX が**全サブオブジェクトを固定順の構造体に展開**して記録する:
+
+```
+u32 this, u32 hr, u8 present +
+  u32 pRootSignature, SHADER_BYTECODE VS, PS, DS, HS, GS, CS,
+  D3D12_STREAM_OUTPUT_DESC, D3D12_BLEND_DESC, u32 SampleMask,
+  D3D12_RASTERIZER_DESC2, D3D12_DEPTH_STENCIL_DESC2 (56B),
+  D3D12_INPUT_LAYOUT_DESC, IBStripCutValue, PrimitiveTopologyType, u32 NumRenderTargets,
+  u64 8 + DXGI_FORMAT RTVFormats[8], DSVFormat, DXGI_SAMPLE_DESC, u32 NodeMask, CachedPSO, Flags,
+  u8[16] ❓, SHADER_BYTECODE MS, SHADER_BYTECODE AS, u8[3] ❓
+GUID riid, u8 present + u32 pipelineState
+```
+- 省略したサブオブジェクトは既定値で埋まる（例: Blend は全 RT が既定）
+- CS の位置（GS の直後）は Compute 用 Stream PSO、MS/AS の順序は AS 付き Mesh PSO で確定（差分解析）
+
+### 3.7 PIX::CreateStateObject（2045） ✅
+
+```
+u32 ?, u32 device,
+u8 present + u64 count(=1) + D3D12_STATE_OBJECT_DESC {
+    u32 Type, u32 NumSubobjects,
+    u64 count + { u32 Type, u8 present + 種別ごとの desc }[count] }
+u8[16] ❓, GUID riid, u8 present + u32 stateObject
+```
+- 種別ごとの desc は D3D12 の構造体（DXIL_LIBRARY, HIT_GROUP, RAYTRACING_SHADER_CONFIG, GLOBAL/LOCAL_ROOT_SIGNATURE, PIPELINE_CONFIG ...）
+- **サブオブジェクト内のポインタ配列（`pExports` 等）は present フラグなしで `u64 count` + 要素**（文字列は通常どおり present + 文字数）
+- SUBOBJECT_TO_EXPORTS_ASSOCIATION（他サブオブジェクトへのポインタを含む）は未検証
 
 ---
 
@@ -228,6 +325,10 @@ u8 data[totalSize]                      ← GetCopyableFootprints のレイア�
 
 ### 4.3 PIX::DescriptorHeap (2044) 🔶
 
+**内容は実行時点のもの**（キャプチャ開始時ではない）✅: フレーム内で `CreateShaderResourceView` / `CopyDescriptorsSimple` で
+書き換えたスロットは書き換え後の内容で記録され、書き換え呼び出し自体はレコードとして現れない。
+（シェーダ可視ヒープのディスクリプタは実行時に読まれるため、GPU が見た内容と一致する）
+
 ```
 u32 ❓(=0), u32 device
 u8 present + D3D12_DESCRIPTOR_HEAP_DESC   (NodeMask は 1 を観測)
@@ -238,12 +339,54 @@ GUID riid (ID3D12DescriptorHeap)
 u8 present + u32 heapId
 ```
 
+### 4.4 PIX::CreatePlacedResource (1767) / PIX::CreateReservedResource (1770) ✅
+
+```
+1767: u32 device, u32 resource, u32 heap, u64 heapOffset, D3D12_RESOURCE_DESC1, <後半>
+1770: u32 device, u32 resource, D3D12_RESOURCE_DESC1, <後半 (state の後に u32 ❓)>, ... u64 tileMappingsSeq (→ 2037) を
+      initialDataSeq の後に持ち、末尾にタイリング情報 (GetResourceTiling 相当と推定) ❓
+<後半> = u32 state, u8 present + CLEAR_VALUE, GUID riid, u64 initialDataSeq, u64 n + u32 states[n]
+```
+
+### 4.5 Enhanced Barriers で作成したテクスチャ（レイアウト管理）✅ / 判別は 🔶
+
+`CreateCommittedResource3` 等で**レイアウト**を持つテクスチャは、1700 の後半が次の形になる:
+```
+u32 1, u32 layoutAtCaptureStart (D3D12_BARRIER_LAYOUT), CLEAR_VALUE, riid, u64 seq,
+u64 n + { u32 ❓(1), u32 layout }[n], u64 ❓
+```
+レガシーステートとの判別: テクスチャで先頭 u32 == 1（= `VERTEX_AND_CONSTANT_BUFFER`、テクスチャでは無効なステート）なら
+レイアウト形式とみなす（🔶）。バッファはレイアウトを持たないためレガシー形式で記録される。
+
+### 4.6 PIX::IndirectArguments (2030) ✅
+
+```
+u8[16] ❓, u64 numCommands,
+{ { u32 argumentType, 引数 }[コマンドシグネチャの引数記述子数] }[numCommands],
+u32 maxCommandCount?, u32 commandCount?, u32 ❓, u8[numCommands] ❓,
+D3D12_COMMAND_SIGNATURE_DESC, u64 size + 引数バッファの生バイト
+```
+引数: DRAW = D3D12_DRAW_ARGUMENTS, DRAW_INDEXED, DISPATCH / DISPATCH_MESH = D3D12_DISPATCH_ARGUMENTS, CONSTANT = u32 × N。
+（VERTEX/INDEX_BUFFER_VIEW, CBV/SRV/UAV, DISPATCH_RAYS 引数は未検証）
+解釈にはコマンドシグネチャが必要なので、直前の ExecuteIndirect の `pCommandSignature` を使う。
+
+### 4.7 PIX::InstanceDescs (2039) ✅
+
+```
+u8[16] ❓, u64 n,
+{ u64 12 + float Transform[12], u32 InstanceID, u32 InstanceMask, u32 ContributionToHitGroupIndex, u32 Flags,
+  GPUVA AccelerationStructure (u64 offset + u32 resource) }[n]
+```
+（`D3D12_RAYTRACING_INSTANCE_DESC` のビットフィールドは u32 に展開され、BLAS アドレスはリソース ID に正規化される）
+
 ---
 
 ## 5. 未解明・今後の課題
 
 - ファイルヘッダ/セクショントレーラの各フィールド、`META` の 20 bytes、EVT ヘッダ reserved
 - D3D12CreateDevice (1566) 後半の caps 構造、2043
-- 未カバー API: ExecuteIndirect, Barrier (Enhanced Barriers), RenderPass, DispatchRays / DXR, Mesh shader, PipelineStateStream (CreatePipelineState), Placed/Reserved resources, 複数キュー, Bundle, Query, CopyDescriptors, PIX3 形式のマーカー (Metadata=2)
-- 複数フレームキャプチャ、大容量リソースの複数ブロック分割
+- 2037（タイルマッピング）・2038（シェーダテーブル）の詳細構造、2041 の前半、2139、2030/2039/1629/2045 の ❓ 領域
+- BLAS をフレーム内でビルドするケース（`pGeometryDescs` のシリアライズ）、EmitPostbuildInfo / CopyRaytracingAccelerationStructure
+- 未検証の引数種別: ExecuteIndirect の VB/IB/CBV/SRV/UAV/DISPATCH_RAYS 引数、SUBOBJECT_TO_EXPORTS_ASSOCIATION、Sampler ヒープのスナップショット
+- WorkGraphs（DispatchGraph / SetProgram）、`WINPIX_EVENT_PIX3BLOB_V2` マーカー
 - PIX のバージョン差（ファイルヘッダ値との対応）

@@ -43,7 +43,27 @@ UNION_SELECTORS: dict[str, tuple[str, dict[int, str]]] = {
         6: "Texture2DMSArray"}),
     "D3D12_VERSIONED_ROOT_SIGNATURE_DESC": ("Version", {1: "Desc_1_0", 2: "Desc_1_1", 3: "Desc_1_2"}),
     "D3D12_TEXTURE_COPY_LOCATION": ("Type", {0: "SubresourceIndex", 1: "PlacedFootprint"}),
+    # "" = union のメンバを書かない (その判別値では union が空)
+    "D3D12_BARRIER_GROUP": ("Type", {0: "pGlobalBarriers", 1: "pTextureBarriers", 2: "pBufferBarriers"}),
+    "D3D12_INDIRECT_ARGUMENT_DESC": ("Type", {
+        0: "", 1: "", 2: "", 3: "VertexBuffer", 4: "", 5: "Constant", 6: "ConstantBufferView",
+        7: "ShaderResourceView", 8: "UnorderedAccessView", 9: "", 10: "", 11: "IncrementingConstant"}),
+    "D3D12_RENDER_PASS_BEGINNING_ACCESS": ("Type", {0: "", 1: "", 2: "Clear", 3: "", 4: "PreserveLocal",
+                                                    5: "PreserveLocal", 6: "PreserveLocal"}),
+    "D3D12_RENDER_PASS_ENDING_ACCESS": ("Type", {0: "", 1: "", 2: "Resolve", 3: "", 4: "PreserveLocal",
+                                                 5: "PreserveLocal", 6: "PreserveLocal"}),
+    "D3D12_RAYTRACING_GEOMETRY_DESC": ("Type", {0: "Triangles", 1: "AABBs", 2: "OmmTriangles"}),
 }
+
+# 構造体内の CPU ディスクリプタハンドル (owner, field) -> 種別
+CPU_HANDLE_KIND_BY_FIELD = {
+    ("D3D12_RENDER_PASS_RENDER_TARGET_DESC", "cpuDescriptor"): "RTV",
+    ("D3D12_RENDER_PASS_DEPTH_STENCIL_DESC", "cpuDescriptor"): "DSV",
+}
+
+# 深度フォーマット (RenderPass の ClearValue は Format が深度なら DepthStencil、それ以外は Color だけが書かれる)
+DEPTH_FORMATS = {"DXGI_FORMAT_D32_FLOAT_S8X24_UINT", "DXGI_FORMAT_D32_FLOAT", "DXGI_FORMAT_D24_UNORM_S8_UINT",
+                 "DXGI_FORMAT_D16_UNORM"}
 
 # union の全メンバを (選択せずに) 順に書き出す構造体
 UNION_ALL_MEMBERS = {"D3D12_CLEAR_VALUE"}
@@ -62,6 +82,55 @@ DESCRIPTOR_KIND = {0: "Empty", 1: "CBV", 2: "SRV", 3: "UAV", 4: "Sampler?", 5: "
 # SAL 上は単一ポインタだが PIX は配列 (present + u64 count + 要素) として記録する引数
 ARRAY_PARAM_OVERRIDES: set[tuple[str, str]] = {
     ("OMSetRenderTargets", "pRenderTargetDescriptors"),
+}
+
+
+def pix_event_text(metadata: int | None, data: bytes) -> str:
+    """BeginEvent/SetMarker の pData を文字列化する。
+    Metadata 0 = UTF-16 文字列, 1 = ANSI 文字列, 2 = PIX3 blob (WinPixEventRuntime 形式):
+      UINT64[]: eventInfo (type = bits 10-19), color, stringInfo (isANSI = bit 54), 文字列 (8 バイト単位)
+    """
+    if metadata == 0:
+        return data.decode("utf-16-le", "replace").split("\x00", 1)[0]
+    if metadata == 1:
+        return data.decode("latin1").split("\x00", 1)[0]
+    if metadata == 2 and len(data) >= 24:
+        info = int.from_bytes(data[16:24], "little")
+        body = data[24:]
+        if (info >> 54) & 1:
+            return body.split(b"\x00", 1)[0].decode("latin1")
+        text = body.decode("utf-16-le", "replace")
+        return text.split("\x00", 1)[0]
+    return f"<metadata={metadata}>"
+
+
+def _trailer_seq(name: str):
+    def fn(r: Reader) -> dict:
+        return {name: r.u64()}
+    return fn
+
+
+def _trailer_resolve(r: Reader) -> dict:
+    # ResolveQueryData: u8 present + u64 resultSeq (PIX::QueryResults) + u64 n + u64[n]
+    if not r.flag():
+        return {}
+    seq = r.u64()
+    n = r.u64()
+    return {"resultSeq": seq, "values": [r.u64() for _ in range(n)]}
+
+
+def _trailer_bundle(r: Reader) -> dict:
+    # ExecuteBundle: ExecuteCommandLists と同じ { u32 list, u64 firstSeq, u64 numRecords }
+    return {"list": r.u32(), "firstSeq": r.u64(), "numRecords": r.u64()}
+
+
+# PIX が API 引数の後ろに付け足す情報 (参照するスナップショットレコードの seq 等)。args["_pix"] に入る
+METHOD_TRAILERS: dict[str, Any] = {
+    "ExecuteIndirect": _trailer_seq("argumentsSeq"),     # -> PIX::IndirectArguments (2030)
+    "DispatchRays": _trailer_seq("shaderTablesSeq"),     # -> PIX::ShaderTables (2038)
+    "ResolveQueryData": _trailer_resolve,                # -> PIX::QueryResults (2046)
+    "ExecuteBundle": _trailer_bundle,
+    "BuildRaytracingAccelerationStructure": _trailer_seq("instanceDescsSeq"),  # -> PIX::InstanceDescs (2039)
 }
 
 
@@ -106,7 +175,9 @@ def _jsonable(v: Any) -> Any:
 class ApiDecoder:
     def __init__(self, db: HeaderDB | None = None):
         self.db = db or load_db()
-        self.bases: dict[str, int] = json.loads((KNOWLEDGE_DIR / "type_bases.json").read_text("utf-8"))["bases"]
+        knowledge = json.loads((KNOWLEDGE_DIR / "type_bases.json").read_text("utf-8"))
+        self.bases: dict[str, int] = knowledge["bases"]
+        self.aliases: dict[str, str] = knowledge.get("aliases", {})
         self.type_map: dict[int, tuple[str, Method]] = {}
         self._build_type_map()
         self.custom: dict[int, tuple[str, Callable[[Reader, "ApiDecoder"], dict]]] = {}
@@ -115,6 +186,7 @@ class ApiDecoder:
         self.iid_map = self.db.iid_to_interface()
         self.objects: dict[int, dict[str, Any]] = {}
         self._cpu_kind: str | None = None
+        self.last_indirect_signature: int | None = None
 
     # ---- type map -------------------------------------------------------------------------------
     def own_methods(self, iface: str) -> list[Method]:
@@ -129,6 +201,12 @@ class ApiDecoder:
                 continue
             for i, m in enumerate(self.own_methods(iface)):
                 self.type_map[base + i] = (iface, m)
+        # 規則に従わない ID (PIX が別番号で記録するメソッド)
+        for tid, full in self.aliases.items():
+            iface, name = full.split("::")
+            m = next((x for x in self.own_methods(iface) if x.name == name), None)
+            if m is not None:
+                self.type_map[int(tid)] = (iface, m)
 
     def api_name(self, typ: int) -> str:
         if typ in self.custom:
@@ -233,6 +311,10 @@ class ApiDecoder:
         return out
 
     def read_struct(self, r: Reader, sname: str) -> dict:
+        if sname == "D3D12_RENDER_PASS_BEGINNING_ACCESS_CLEAR_PARAMETERS":
+            return {"ClearValue": self.read_clear_value_selected(r)}
+        if sname == "D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS":
+            return self.read_build_inputs(r)
         st = self.db.structs[sname]
         out: dict[str, Any] = {}
         sel = UNION_SELECTORS.get(sname)
@@ -249,6 +331,9 @@ class ApiDecoder:
                 member = sel[1].get(disc_v)
                 if member is None:
                     raise DecodeError(f"{sname}: unknown union selector {disc}")
+                if member == "":
+                    union_done.add(f.union)
+                    continue
                 if f.name != member:
                     # 同 union の選択メンバを探す
                     fm = next((x for x in st.fields if x.union == f.union and x.name == member), None)
@@ -256,7 +341,33 @@ class ApiDecoder:
                         raise DecodeError(f"{sname}: member {member} not found")
                     f = fm
                 union_done.add(f.union)
+            kind = CPU_HANDLE_KIND_BY_FIELD.get((sname, f.name))
+            if kind:
+                self._cpu_kind = kind
             out[f.name] = self.read_field(r, f.type, f.ptr, f.array, sname, f.name)
+        return out
+
+    def read_clear_value_selected(self, r: Reader) -> dict:
+        """RenderPass の D3D12_CLEAR_VALUE: Format が深度なら DepthStencil、それ以外は Color のみ。"""
+        fmt = self.read_type(r, "DXGI_FORMAT")
+        if fmt in DEPTH_FORMATS:
+            return {"Format": fmt, "DepthStencil": self.read_type(r, "D3D12_DEPTH_STENCIL_VALUE")}
+        return {"Format": fmt, "Color": self.read_field(r, "FLOAT", 0, "4", "D3D12_CLEAR_VALUE", "Color")}
+
+    def read_build_inputs(self, r: Reader) -> dict:
+        """D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS: union は Type (TOP=InstanceDescs) と DescsLayout で選択。"""
+        out: dict[str, Any] = {}
+        for name, typ in (("Type", "D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE"),
+                          ("Flags", "D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS"),
+                          ("NumDescs", "UINT"), ("DescsLayout", "D3D12_ELEMENTS_LAYOUT")):
+            out[name] = self.read_type(r, typ)
+        if out["Type"] in (0, "D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL"):
+            out["InstanceDescs"] = self.read_type(r, "D3D12_GPU_VIRTUAL_ADDRESS")
+            out["unk?"] = r.u64()   # TOP_LEVEL では union の後ろに 8 バイト (0 を観測)
+        elif out["DescsLayout"] in (0, "D3D12_ELEMENTS_LAYOUT_ARRAY"):
+            out["pGeometryDescs"] = self.read_field(r, "D3D12_RAYTRACING_GEOMETRY_DESC", 1, "", "INPUTS", "pGeometryDescs")
+        else:
+            out["ppGeometryDescs"] = self.read_field(r, "D3D12_RAYTRACING_GEOMETRY_DESC", 1, "", "INPUTS", "ppGeometryDescs")
         return out
 
     def read_field(self, r: Reader, typ: str, ptr: int, array: str, owner: str, name: str) -> Any:
@@ -364,6 +475,9 @@ class ApiDecoder:
                     call.hr = r.u32()
                 for p in m.params:
                     call.args[p.name] = self.read_param(r, p, m.name)
+                trailer = METHOD_TRAILERS.get(m.name)
+                if trailer is not None:
+                    call.args["_pix"] = trailer(r)
                 self._post_process(call, iface, m)
             else:
                 raise DecodeError("unknown type id")
@@ -387,5 +501,12 @@ class ApiDecoder:
             if isinstance(v, dict) and "obj" in v and ("Outptr" in p.sal) and riid:
                 self.note_object(v["obj"], interface=self.iid_map.get(riid, riid), created_by=call.api,
                                  seq=call.seq)
+        if m.name in ("BeginEvent", "SetMarker") and isinstance(call.args.get("pData"), (bytes, bytearray)):
+            call.args["_text"] = pix_event_text(call.args.get("Metadata"), bytes(call.args["pData"]))
         if m.name == "SetName" and call.this is not None:
             self.note_object(call.this, name=call.args.get("Name"))
+        if m.name == "CreateCommandSignature":
+            sig = (call.args.get("ppvCommandSignature") or {}).get("obj")
+            self.note_object(sig, desc=call.args.get("pDesc"))
+        if m.name == "ExecuteIndirect":
+            self.last_indirect_signature = (call.args.get("pCommandSignature") or {}).get("obj")

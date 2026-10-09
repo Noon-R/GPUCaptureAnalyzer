@@ -1,10 +1,18 @@
 {
-  "_comment": "EVT typeId = bases[宣言インターフェース] + 自前メソッド順。PIX 2603.25 で観測。根拠は docs/formats/wpix.md",
+  "_comment": "EVT typeId = bases[宣言インターフェース] + 自前メソッド順。PIX 2603.25 で観測。aliases は規則に従わない ID (PIX が別番号で記録するもの)。根拠は docs/formats/wpix.md",
   "bases": {
     "ID3D12Object": 970,
     "ID3D12GraphicsCommandList": 992,
     "ID3D12CommandQueue": 1063,
     "ID3D12Device": 1074,
-    "ID3D12Device4": 1711
+    "ID3D12Device2": 1629,
+    "ID3D12Device4": 1711,
+    "ID3D12GraphicsCommandList4": 1919,
+    "ID3D12GraphicsCommandList6": 1999,
+    "ID3D12GraphicsCommandList7": 2081
+  },
+  "aliases": {
+    "1849": "ID3D12GraphicsCommandList4::BeginRenderPass",
+    "1850": "ID3D12GraphicsCommandList4::EndRenderPass"
   }
 }

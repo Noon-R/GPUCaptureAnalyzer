@@ -4,12 +4,17 @@ namespace Gcap.Wpix;
 
 /// <summary>
 /// コマンドリストを再生して、各 Draw/Dispatch 時点のパイプライン状態とバインドされたリソースを解決する。
-/// 制限: ディスクリプタヒープはキャプチャ開始時のスナップショットを使う (フレーム内の書き換えは未反映)。
+/// Python 版 tools/gcap/wpix/state.py と同じ出力。
+///   * Draw*/Dispatch/DispatchMesh/DispatchRays/ExecuteIndirect (間接引数は PIX::IndirectArguments から展開)
+///   * Bundle (ExecuteBundle は呼び出し元の状態を継承して中身を再生)
+///   * RenderPass (BeginRenderPass の RT/DS を出力先として扱う)
+/// ディスクリプタヒープの内容は PIX::DescriptorHeap のスナップショット (実行時点の内容。フレーム内の書き換えを反映済み)。
 /// </summary>
 public sealed class DrawAnalyzer
 {
     private static readonly Dictionary<string, string> RegPrefix = new() { ["SRV"] = "t", ["UAV"] = "u", ["CBV"] = "b", ["Sampler"] = "s" };
-    private static readonly HashSet<string> DrawApis = ["DrawInstanced", "DrawIndexedInstanced", "Dispatch", "ExecuteIndirect", "DispatchRays", "DispatchMesh"];
+    private static readonly HashSet<string> DrawApis = ["DrawInstanced", "DrawIndexedInstanced", "Dispatch", "DispatchMesh", "DispatchRays", "ExecuteIndirect"];
+    private static readonly HashSet<string> ComputeIndirectTypes = ["D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH", "D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS"];
 
     private readonly Capture _cap;
     private readonly Dictionary<long, Obj> _rootsigs = [];
@@ -17,7 +22,7 @@ public sealed class DrawAnalyzer
 
     private sealed class State
     {
-        public long? Pso;
+        public long? Pso, StateObject;
         public readonly Dictionary<string, long?> RootSig = new() { ["Graphics"] = null, ["Compute"] = null };
         public readonly Dictionary<string, SortedDictionary<long, (string kind, object? val)>> Root = new()
         {
@@ -26,6 +31,7 @@ public sealed class DrawAnalyzer
         public List<Obj> Vb = [];
         public object? Ib, Topology, Dsv, Viewports, Scissors;
         public List<object?> Rtv = [];
+        public bool RenderPass;
     }
 
     public DrawAnalyzer(Capture cap)
@@ -108,109 +114,169 @@ public sealed class DrawAnalyzer
         return outp;
     }
 
+    private (string pipe, object? commands) Indirect(Call c)
+    {
+        var seq = c.Args.GetObj("_pix")?.GetLong("argumentsSeq");
+        var snap = seq is long s ? _cap.CallBySeq((ulong)s, "PIX::IndirectArguments") : null;
+        var sigId = c.Args.ObjId("pCommandSignature");
+        var sig = sigId is long sid && _cap.Objects.TryGetValue(sid, out var so) ? so.GetObj("desc") : null;
+        var types = (sig?.GetList("pArgumentDescs") ?? []).OfType<Obj>().Select(a => a.GetStr("Type")).ToHashSet();
+        var pipe = types.Overlaps(ComputeIndirectTypes!) ? "Compute" : "Graphics";
+        return (pipe, snap?.Args.Get("commands"));
+    }
+
+    private object? ShaderTableExports(Call c)
+    {
+        var seq = c.Args.GetObj("_pix")?.GetLong("shaderTablesSeq");
+        var snap = seq is long s ? _cap.CallBySeq((ulong)s, "PIX::ShaderTables") : null;
+        return snap?.Args.Get("exports");
+    }
+
+    private static Obj Copy(Obj o)
+    {
+        var n = new Obj();
+        foreach (var kv in o) n[kv.Key] = kv.Value;
+        return n;
+    }
+
+    private State Process(Call c, State st, CommandListRecording cl, List<Obj> draws, string? bundle = null)
+    {
+        var m = c.Method;
+        var a = c.Args;
+        switch (m)
+        {
+            case "Reset":
+                st = new State();
+                var init = a.ObjId("pInitialState");
+                st.Pso = init is 0 ? null : init;
+                break;
+            case "SetPipelineState":
+                st.Pso = a.ObjId("pPipelineState");
+                st.StateObject = null;
+                break;
+            case "SetPipelineState1": st.StateObject = a.ObjId("pStateObject"); break;
+            case "SetGraphicsRootSignature" or "SetComputeRootSignature":
+            {
+                var pipe = m.Contains("Graphics") ? "Graphics" : "Compute";
+                st.RootSig[pipe] = a.ObjId("pRootSignature");
+                st.Root[pipe] = [];
+                break;
+            }
+            case "IASetVertexBuffers":
+            {
+                long start = a.GetLong("StartSlot") ?? 0;
+                int i = 0;
+                foreach (var vo in a.GetList("pViews") ?? [])
+                {
+                    if (vo is not Obj v) continue;
+                    long slot = start + i++;
+                    var loc = v.GetObj("BufferLocation")!;
+                    st.Vb = st.Vb.Where(x => x.GetLong("slot") != slot).ToList();
+                    st.Vb.Add(new Obj
+                    {
+                        ["slot"] = slot, ["resource"] = Name(loc.GetLong("resource")), ["offset"] = loc.Get("offset"),
+                        ["size"] = v.Get("SizeInBytes"), ["stride"] = v.Get("StrideInBytes"),
+                    });
+                }
+                break;
+            }
+            case "IASetIndexBuffer":
+            {
+                var v = a.GetObj("pView");
+                var loc = v?.GetObj("BufferLocation");
+                st.Ib = v is null || loc is null ? null : new Obj
+                {
+                    ["resource"] = Name(loc.GetLong("resource")), ["offset"] = loc.Get("offset"),
+                    ["size"] = v.Get("SizeInBytes"), ["format"] = v.Get("Format"),
+                };
+                break;
+            }
+            case "IASetPrimitiveTopology": st.Topology = a.Get("PrimitiveTopology"); break;
+            case "OMSetRenderTargets":
+            {
+                st.Rtv = (a.GetList("pRenderTargetDescriptors") ?? []).OfType<Obj>()
+                    .Select(h => (object?)new Obj { ["resource"] = Name(h.GetLong("resource")), ["view"] = h.Get("view") }).ToList();
+                var d = a.GetObj("pDepthStencilDescriptor");
+                st.Dsv = d is null ? null : new Obj { ["resource"] = Name(d.GetLong("resource")), ["view"] = d.Get("view") };
+                break;
+            }
+            case "BeginRenderPass":
+            {
+                st.Rtv = (a.GetList("pRenderTargets") ?? []).OfType<Obj>().Select(t => t.GetObj("cpuDescriptor")!)
+                    .Select(h => (object?)new Obj { ["resource"] = Name(h.GetLong("resource")), ["view"] = h.Get("view") }).ToList();
+                var ds = a.GetObj("pDepthStencil")?.GetObj("cpuDescriptor");
+                st.Dsv = ds is null ? null : new Obj { ["resource"] = Name(ds.GetLong("resource")), ["view"] = ds.Get("view") };
+                st.RenderPass = true;
+                break;
+            }
+            case "EndRenderPass":
+                st.Rtv = [];
+                st.Dsv = null;
+                st.RenderPass = false;
+                break;
+            case "RSSetViewports": st.Viewports = a.Get("pViewports"); break;
+            case "RSSetScissorRects": st.Scissors = a.Get("pRects"); break;
+            case "ExecuteBundle":
+            {
+                var bname = Name(a.ObjId("pCommandList"));
+                foreach (var bc in _cap.BundleCommands(c)) st = Process(bc, st, cl, draws, bname);
+                break;
+            }
+            default:
+                if (m.StartsWith("SetGraphicsRoot") || m.StartsWith("SetComputeRoot"))
+                {
+                    var pipe = m.StartsWith("SetGraphics") ? "Graphics" : "Compute";
+                    long idx = a.GetLong("RootParameterIndex") ?? 0;
+                    if (m.EndsWith("DescriptorTable")) st.Root[pipe][idx] = ("table", a.Get("BaseDescriptor"));
+                    else if (m.EndsWith("32BitConstants"))
+                        st.Root[pipe][idx] = ("constants", a.Get("pSrcData") is byte[] bs ? V.Hex(bs.AsSpan(0, Math.Min(64, bs.Length))) + (bs.Length > 64 ? "..." : "") : null);
+                    else if (m.EndsWith("32BitConstant")) st.Root[pipe][idx] = ("constants", a.Get("SrcData"));
+                    else if (m.EndsWith("ConstantBufferView")) st.Root[pipe][idx] = ("CBV", a.Get("BufferLocation"));
+                    else if (m.EndsWith("ShaderResourceView")) st.Root[pipe][idx] = ("SRV", a.Get("BufferLocation"));
+                    else if (m.EndsWith("UnorderedAccessView")) st.Root[pipe][idx] = ("UAV", a.Get("BufferLocation"));
+                }
+                else if (DrawApis.Contains(m))
+                {
+                    string pipe;
+                    object? indirect = null;
+                    if (m == "ExecuteIndirect") (pipe, indirect) = Indirect(c);
+                    else pipe = m is "Dispatch" or "DispatchRays" ? "Compute" : "Graphics";
+                    var args = new Obj();
+                    foreach (var kv in a) if (kv.Key != "_pix") args[kv.Key] = kv.Value;
+                    var d = new Obj
+                    {
+                        ["seq"] = c.Seq, ["queue"] = Name(cl.Queue), ["commandList"] = Name(cl.List), ["bundle"] = bundle,
+                        ["call"] = m, ["args"] = args,
+                        ["pso"] = Name(m == "DispatchRays" ? st.StateObject : st.Pso),
+                        ["rootSignature"] = Name(st.RootSig[pipe]), ["bindings"] = Bindings(st, pipe),
+                    };
+                    if (m == "DispatchRays") d["shaderTableExports"] = ShaderTableExports(c);
+                    if (m == "ExecuteIndirect") d["indirectCommands"] = indirect;
+                    if (pipe == "Graphics")
+                    {
+                        d["topology"] = st.Topology;
+                        d["vertexBuffers"] = st.Vb.Select(x => (object?)Copy(x)).ToList();
+                        d["indexBuffer"] = st.Ib;
+                        d["renderTargets"] = st.Rtv;
+                        d["depthStencil"] = st.Dsv;
+                        d["inRenderPass"] = st.RenderPass;
+                        d["viewports"] = st.Viewports;
+                        d["scissors"] = st.Scissors;
+                    }
+                    draws.Add(d);
+                }
+                break;
+        }
+        return st;
+    }
+
     public List<Obj> Run()
     {
         var draws = new List<Obj>();
         foreach (var cl in _cap.CommandLists())
         {
             var st = new State();
-            foreach (var c in cl.Commands)
-            {
-                var m = c.Method;
-                var a = c.Args;
-                switch (m)
-                {
-                    case "Reset":
-                        st = new State();
-                        var init = a.ObjId("pInitialState");
-                        st.Pso = init is 0 ? null : init;
-                        break;
-                    case "SetPipelineState": st.Pso = a.ObjId("pPipelineState"); break;
-                    case "SetGraphicsRootSignature" or "SetComputeRootSignature":
-                    {
-                        var pipe = m.Contains("Graphics") ? "Graphics" : "Compute";
-                        st.RootSig[pipe] = a.ObjId("pRootSignature");
-                        st.Root[pipe] = [];
-                        break;
-                    }
-                    case "IASetVertexBuffers":
-                    {
-                        long start = a.GetLong("StartSlot") ?? 0;
-                        int i = 0;
-                        foreach (var vo in a.GetList("pViews") ?? [])
-                        {
-                            if (vo is not Obj v) continue;
-                            long slot = start + i++;
-                            var loc = v.GetObj("BufferLocation")!;
-                            st.Vb = st.Vb.Where(x => x.GetLong("slot") != slot).ToList();
-                            st.Vb.Add(new Obj
-                            {
-                                ["slot"] = slot, ["resource"] = Name(loc.GetLong("resource")), ["offset"] = loc.Get("offset"),
-                                ["size"] = v.Get("SizeInBytes"), ["stride"] = v.Get("StrideInBytes"),
-                            });
-                        }
-                        break;
-                    }
-                    case "IASetIndexBuffer":
-                    {
-                        var v = a.GetObj("pView");
-                        var loc = v?.GetObj("BufferLocation");
-                        st.Ib = v is null || loc is null ? null : new Obj
-                        {
-                            ["resource"] = Name(loc.GetLong("resource")), ["offset"] = loc.Get("offset"),
-                            ["size"] = v.Get("SizeInBytes"), ["format"] = v.Get("Format"),
-                        };
-                        break;
-                    }
-                    case "IASetPrimitiveTopology": st.Topology = a.Get("PrimitiveTopology"); break;
-                    case "OMSetRenderTargets":
-                    {
-                        st.Rtv = (a.GetList("pRenderTargetDescriptors") ?? []).OfType<Obj>()
-                            .Select(h => (object?)new Obj { ["resource"] = Name(h.GetLong("resource")), ["view"] = h.Get("view") }).ToList();
-                        var d = a.GetObj("pDepthStencilDescriptor");
-                        st.Dsv = d is null ? null : new Obj { ["resource"] = Name(d.GetLong("resource")), ["view"] = d.Get("view") };
-                        break;
-                    }
-                    case "RSSetViewports": st.Viewports = a.Get("pViewports"); break;
-                    case "RSSetScissorRects": st.Scissors = a.Get("pRects"); break;
-                    default:
-                        if (m.StartsWith("SetGraphicsRoot") || m.StartsWith("SetComputeRoot"))
-                        {
-                            var pipe = m.StartsWith("SetGraphics") ? "Graphics" : "Compute";
-                            long idx = a.GetLong("RootParameterIndex") ?? 0;
-                            if (m.EndsWith("DescriptorTable")) st.Root[pipe][idx] = ("table", a.Get("BaseDescriptor"));
-                            else if (m.EndsWith("32BitConstants"))
-                                st.Root[pipe][idx] = ("constants", a.Get("pSrcData") is byte[] bs ? V.Hex(bs) : null);
-                            else if (m.EndsWith("32BitConstant")) st.Root[pipe][idx] = ("constants", a.Get("SrcData"));
-                            else if (m.EndsWith("ConstantBufferView")) st.Root[pipe][idx] = ("CBV", a.Get("BufferLocation"));
-                            else if (m.EndsWith("ShaderResourceView")) st.Root[pipe][idx] = ("SRV", a.Get("BufferLocation"));
-                            else if (m.EndsWith("UnorderedAccessView")) st.Root[pipe][idx] = ("UAV", a.Get("BufferLocation"));
-                        }
-                        else if (DrawApis.Contains(m))
-                        {
-                            var pipe = m.StartsWith("Dispatch") ? "Compute" : "Graphics";
-                            var args = new Obj();
-                            foreach (var kv in a) args[kv.Key] = kv.Value;
-                            var d = new Obj
-                            {
-                                ["seq"] = c.Seq, ["commandList"] = Name(cl.List), ["call"] = m, ["args"] = args,
-                                ["pso"] = Name(st.Pso), ["rootSignature"] = Name(st.RootSig[pipe]), ["bindings"] = Bindings(st, pipe),
-                            };
-                            if (pipe == "Graphics")
-                            {
-                                d["topology"] = st.Topology;
-                                d["vertexBuffers"] = st.Vb.Cast<object?>().ToList();
-                                d["indexBuffer"] = st.Ib;
-                                d["renderTargets"] = st.Rtv;
-                                d["depthStencil"] = st.Dsv;
-                                d["viewports"] = st.Viewports;
-                                d["scissors"] = st.Scissors;
-                            }
-                            draws.Add(d);
-                        }
-                        break;
-                }
-            }
+            foreach (var c in cl.Commands) st = Process(c, st, cl, draws);
         }
         return draws;
     }

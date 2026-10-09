@@ -55,6 +55,24 @@ public static class ShaderExporter
             }
         }
 
+        foreach (var c in cap.Calls.Where(c => c.Ok && c.Api == "PIX::CreateStateObject"))
+        {
+            long so = c.Args.GetLong("ppStateObject") ?? 0;
+            foreach (var sub in (c.Args.GetObj("pDesc")?.GetList("pSubobjects") ?? []).OfType<Obj>())
+            {
+                if (sub.GetObj("desc")?.GetObj("DXILLibrary")?.Get("pShaderBytecode") is not byte[] bc || bc.Length == 0) continue;
+                var contentKey = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bc));
+                if (!byContent.TryGetValue(contentKey, out var e))
+                {
+                    var dc = new DxContainer(bc);
+                    e = new Entry { Bytecode = bc, Container = dc, Key = new ShaderSymbolKey { HashHex = dc.HashHex, DebugName = dc.DebugName } };
+                    byContent[contentKey] = e;
+                    entries.Add(e);
+                }
+                e.Uses.Add((so, "LIB"));
+            }
+        }
+
         // ---- 探索 ----
         using var dxc = Dxc.TryLoad();
         var log = o.Verbose ? (Action<string>)(s => Console.Error.WriteLine(s)) : null;

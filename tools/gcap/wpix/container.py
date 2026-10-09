@@ -125,12 +125,18 @@ class WpixFile:
         sec.header_bytes = b[start:start + 0x40]
         sec.footer_unknown = b[end - 0x40:end - 4]
         entries, _ = _read_dir_table(b, end - 0x40, b"DIR2")
+        # 同じストリーム ID のエントリが複数あることがある (大きいデータ/複数フレーム)。出現順に連結する
+        #  (レコードはエントリ境界をまたいで続く)
         for de in entries:
-            st = Stream(de.id, de)
-            st.blocks = self._parse_blocks(de.offset, de.offset + de.size)
-            if decompress:
+            blocks = self._parse_blocks(de.offset, de.offset + de.size)
+            st = sec.streams.get(de.id)
+            if st is None:
+                st = Stream(de.id, de)
+                sec.streams[de.id] = st
+            st.blocks.extend(blocks)
+        if decompress:
+            for st in sec.streams.values():
                 st._data = b"".join(self._decompress_block(blk) for blk in st.blocks)
-            sec.streams[de.id] = st
         return sec
 
     def _parse_blocks(self, start: int, end: int) -> list[Block]:

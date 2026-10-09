@@ -2,6 +2,13 @@
 
 Usage:
     python scripts/capture_pix.py --variants 0 1 2 3 [--no-oracle] [--out captures/pix]
+    python scripts/capture_pix.py --preset all      # 下記のテスト用キャプチャ一式をまとめて取得
+
+Presets (tests/ が参照するキャプチャ):
+    base   captures/pix        v0..v3  既定 (DXBC シェーダ)
+    dxil   captures/pix_dxil   v0..v1  --dxil (DXIL + 分離 PDB)
+    ext    captures/pix_ext    v0..v1  --extras --dxil (拡張 API 一式)
+    multi  captures/pix_multi  v0      --capture-count 2 (複数フレーム)
 
 出力 (variant N 毎):
     vN.wpix          PIX GPU capture
@@ -66,15 +73,35 @@ def oracle(pixtool: Path, wpix: Path) -> None:
     subprocess.run(cmd, check=True, timeout=600)
 
 
+PRESETS = {
+    "base": ("pix", [0, 1, 2, 3], []),
+    "dxil": ("pix_dxil", [0, 1], ["--dxil"]),
+    "ext": ("pix_ext", [0, 1], ["--extras", "--dxil"]),
+    "multi": ("pix_multi", [0], ["--capture-count", "2"]),
+}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--preset", choices=[*PRESETS, "all"])
     ap.add_argument("--variants", type=int, nargs="+", default=[0, 1, 2, 3])
     ap.add_argument("--out", type=Path, default=ROOT / "captures" / "pix")
     ap.add_argument("--no-oracle", action="store_true")
     ap.add_argument("--app-args", nargs=argparse.REMAINDER, default=[])
     a = ap.parse_args()
-    a.out.mkdir(parents=True, exist_ok=True)
     pixtool = find_pixtool()
+    if a.preset:
+        for name in (PRESETS if a.preset == "all" else [a.preset]):
+            sub, variants, app_args = PRESETS[name]
+            out = (ROOT / "captures" / sub).resolve()
+            out.mkdir(parents=True, exist_ok=True)
+            for v in variants:
+                wpix = capture(v, out, app_args)
+                if not a.no_oracle:
+                    oracle(pixtool, wpix)
+        print("done")
+        return
+    a.out.mkdir(parents=True, exist_ok=True)
     for v in a.variants:
         wpix = capture(v, a.out.resolve(), a.app_args)
         if not a.no_oracle:

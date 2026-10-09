@@ -163,17 +163,10 @@ public static class Program
         Console.Error.WriteLine($"# {cap.Calls.Count} records, {cap.Failed().Count} failed");
     }
 
-    private static string EventText(Call c)
-    {
-        var md = c.Args.GetLong("Metadata");
-        if (c.Args.Get("pData") is not byte[] raw) return "?";
-        return md switch
-        {
-            0 => Encoding.Unicode.GetString(raw).TrimEnd('\0'),
-            1 => Encoding.Latin1.GetString(raw).TrimEnd('\0'),
-            _ => $"<pix3 metadata={md}>",
-        };
-    }
+    private static string EventText(Call c) => c.Args.GetStr("_text") ?? "?";
+
+    private static string FormatArgsNoPix(Obj args, Capture cap) =>
+        string.Join(", ", args.Where(kv => kv.Key != "_pix").Select(kv => $"{kv.Key}={Short(kv.Value, cap)}"));
 
     private static void CmdLists(Capture cap)
     {
@@ -193,7 +186,10 @@ public static class Program
                     if (name == "BeginEvent") depth++;
                     continue;
                 }
-                Console.WriteLine($"{ind}{c.Seq,5} {name}({FormatArgs(c.Args, cap)})");
+                Console.WriteLine($"{ind}{c.Seq,5} {name}({FormatArgsNoPix(c.Args, cap)})");
+                if (name == "ExecuteBundle")
+                    foreach (var bc in cap.BundleCommands(c))
+                        Console.WriteLine($"{ind}    | {bc.Seq,5} {bc.Method}({FormatArgsNoPix(bc.Args, cap)})");
             }
         }
     }
@@ -217,8 +213,12 @@ public static class Program
         foreach (var d in draws)
         {
             var args = string.Join(", ", d.GetObj("args")!.Select(kv => $"{kv.Key}={Short(kv.Value, cap)}"));
-            Console.WriteLine($"[{d.Get("seq")}] {d.Get("call")}({args})  list={d.Get("commandList")}");
+            var where = $"queue={d.Get("queue")} list={d.Get("commandList")}" + (d.Get("bundle") is string b0 ? $" bundle={b0}" : "");
+            Console.WriteLine($"[{d.Get("seq")}] {d.Get("call")}({args})  {where}");
             Console.WriteLine($"    PSO={d.Get("pso")}  RootSig={d.Get("rootSignature")}");
+            if (d.Get("indirectCommands") is { } ic) Console.WriteLine($"    indirect: {Short(ic, cap)}");
+            if (d.Get("shaderTableExports") is List<object?> ex)
+                Console.WriteLine($"    shader tables: [{string.Join(", ", ex.Select(x => $"'{x}'"))}]");
             foreach (var b in d.GetList("bindings")!.OfType<Obj>())
             {
                 var head = $"    root[{b.Get("rootParam")}] {b.GetStr("type"),-9} vis={b.Get("visibility")}";
@@ -241,7 +241,8 @@ public static class Program
                 var vbs = string.Join(", ", d.GetList("vertexBuffers")!.OfType<Obj>().Select(v => $"({v.Get("slot")}, {v.Get("resource")}, {v.Get("stride")})"));
                 Console.WriteLine($"    IA: {d.Get("topology")} VB=[{vbs}] IB={d.GetObj("indexBuffer")?.Get("resource")}");
                 var rts = string.Join(", ", d.GetList("renderTargets")!.OfType<Obj>().Select(r => r.Get("resource")));
-                Console.WriteLine($"    OM: RTV=[{rts}] DSV={d.GetObj("depthStencil")?.Get("resource")}");
+                Console.WriteLine($"    OM: RTV=[{rts}] DSV={d.GetObj("depthStencil")?.Get("resource")}" +
+                                  (d.Get("inRenderPass") is true ? "  (render pass)" : ""));
             }
         }
     }
@@ -296,7 +297,7 @@ public static class Program
             {
                 var pso = c.Args.ObjId("ppPipelineState") ?? 0;
                 var desc = c.Args.GetObj("pDesc");
-                foreach (var stage in new[] { "VS", "PS", "DS", "HS", "GS", "CS" })
+                foreach (var stage in new[] { "VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS" })
                 {
                     if (desc?.GetObj(stage)?.Get("pShaderBytecode") is not byte[] blob) continue;
                     var nm = cap.Objects.GetValueOrDefault(pso)?.GetStr("name") ?? $"pso{pso}";
@@ -304,6 +305,20 @@ public static class Program
                     var fname = $"{pso:D4}_{nm}_{stage}.{ext}";
                     File.WriteAllBytes(Path.Combine(outDir, "shaders", fname), blob);
                     shaders.Add(new Obj { ["pso"] = pso, ["stage"] = stage, ["file"] = $"shaders/{fname}" });
+                }
+            }
+            if (c.Api == "PIX::CreateStateObject")
+            {
+                // DXR などの StateObject: DXIL ライブラリを書き出す
+                var so = c.Args.GetLong("ppStateObject") ?? 0;
+                var nm = cap.Objects.GetValueOrDefault(so)?.GetStr("name") ?? $"so{so}";
+                int li = 0;
+                foreach (var sub in (c.Args.GetObj("pDesc")?.GetList("pSubobjects") ?? []).OfType<Obj>())
+                {
+                    if (sub.GetObj("desc")?.GetObj("DXILLibrary")?.Get("pShaderBytecode") is not byte[] lib) continue;
+                    var fname = $"{so:D4}_{nm}_LIB{li++}.dxil";
+                    File.WriteAllBytes(Path.Combine(outDir, "shaders", fname), lib);
+                    shaders.Add(new Obj { ["stateObject"] = so, ["stage"] = "LIB", ["file"] = $"shaders/{fname}" });
                 }
             }
             if (c.Api.EndsWith("::CreateRootSignature") && c.Args.Get("pBlobWithRootSignature") is byte[] rsb)

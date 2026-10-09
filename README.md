@@ -8,10 +8,15 @@ PIX などの GUI/CLI では取り出しにくい情報を自動解析できる�
 
 ## 現在できること（PIX 2603.25 / D3D12）
 
+対応 API（すべて実キャプチャで検証済み）: 基本の描画/コンピュート/コピー/バリア、Placed・Reserved（タイル）リソース、Query、
+ExecuteIndirect、RenderPass、Bundle、PipelineStateStream、Mesh/Amplification シェーダ、Enhanced Barriers、
+DXR（StateObject・加速構造・DispatchRays）、Copy/Compute キュー + Fence 同期、PIX3 形式マーカー、複数フレームキャプチャ。
+
+
 - `.wpix` コンテナの完全パース（XPRESS 圧縮ブロックの展開、ストリーム/ディレクトリ構造）
 - 記録された **全 API 呼び出しのデコード**（d3d12.h から自動生成した型情報 + 解析で判明したシリアライズ規則）
   - 引数・構造体・enum 名・オブジェクト名（SetName）・GPU VA（リソース+オフセット）・ディスクリプタの中身
-- コマンドリスト単位のコマンド列再構成（PIX マーカーの階層付き）
+- キュー・コマンドリスト単位のコマンド列再構成（PIX マーカーの階層付き、Bundle の展開）
 - **Draw/Dispatch 毎のバインディング解決**（ルートシグネチャ blob を解析し、ディスクリプタテーブル → 実リソース、VB/IB、RTV/DSV を特定）
 - キャプチャ開始時点のリソース内容・ステート・ディスクリプタヒープのスナップショット
 - リソース初期データ / シェーダバイトコード / ルートシグネチャ / スクリーンショットの抽出
@@ -20,7 +25,7 @@ PIX などの GUI/CLI では取り出しにくい情報を自動解析できる�
   見つからないシェーダは IL（DXIL/DXBC 逆アセンブル）で書き出す → [docs/shader-symbols.md](docs/shader-symbols.md)
 - 未知形式向けのバイナリ調査ツール（Python 版のみ: エントロピー、タグ、既知値検索、圧縮総当たり）
 
-**解析手順書（他プラットフォームにも適用可）: [docs/reverse-engineering-guide.md](docs/reverse-engineering-guide.md)**
+**ツールの出力例: [docs/tool-output.md](docs/tool-output.md)** / **解析手順書（他プラットフォームにも適用可）: [docs/reverse-engineering-guide.md](docs/reverse-engineering-guide.md)**
 
 フォーマットの詳細: [docs/formats/wpix.md](docs/formats/wpix.md) / 作業ループ: [docs/methodology.md](docs/methodology.md) /
 Nsight の状況: [docs/formats/nsight.md](docs/formats/nsight.md)
@@ -57,7 +62,9 @@ samples/DX12CaptureTarget/   既知の値を埋め込んだ DX12 テストアプ
 scripts/capture_pix.py       variant 毎にキャプチャ + pixtool で正解データ (event list / export-to-cpp) を生成
 tests/test_wpix.py           Python 版: manifest 照合 + export-to-cpp 照合
 tests/test_csharp_parity.py  C# 版 == Python 版 (calls / draws / extract の出力一致)
+tests/test_wpix_ext.py       Python 版: 拡張 API (DXR/Mesh/EB/RenderPass/Bundle/ExecuteIndirect/...) と複数フレーム
 tests/test_shader_symbols.py シェーダ PDB 探索 (キャプチャフォルダ/指定フォルダ/ストア/HTTP/打ち切り/古い PDB の除外/IL)
+scripts/gen_tool_output_doc.py docs/tool-output.md (出力例) の再生成
 docs/                        フォーマット仕様・手法
 captures/                    キャプチャ置き場 (git 管理外)
 ```
@@ -69,10 +76,8 @@ captures/                    キャプチャ置き場 (git 管理外)
 cmake -S samples/DX12CaptureTarget -B samples/DX12CaptureTarget/build -G "Visual Studio 18 2026" -A x64
 cmake --build samples/DX12CaptureTarget/build --config Release
 
-# キャプチャ取得 (variant 0..3) + pixtool による正解データ生成
-python scripts/capture_pix.py --variants 0 1 2 3
-# DXIL シェーダ (dxc -Zi -Qstrip_debug, PDB は bin/shaders/pdb/ に分離) 版: シンボル照合のテスト用
-python scripts/capture_pix.py --variants 0 1 --out captures/pix_dxil --app-args --dxil
+# テスト用キャプチャ一式 (base / dxil / ext / multi) + pixtool による正解データ生成
+python scripts/capture_pix.py --preset all
 
 # 解析作業用 (Python)
 cd tools
@@ -96,13 +101,14 @@ cd .. && dotnet publish src/gcap -c Release -o dist && python -m unittest discov
 
 当面は PIX (.wpix) の対応範囲を広げる。Nsight Graphics は NVIDIA GPU 環境の用意後に着手する。
 
-1. ~~シェーダシンボル（PDB 探索・照合、IL 書き出し）~~ 対応済み。PIX の公式シンボルサーバ形式との一致確認が残課題
-2. ExecuteIndirect / CommandSignature、Enhanced Barriers (`Barrier`)、RenderPass
-3. PipelineStateStream (`CreatePipelineState`)、Placed / Reserved リソース、CopyDescriptors
-4. 複数キュー（Copy / Compute）・複数コマンドリスト・Bundle・Query
-5. DXR（`DispatchRays`、AS ビルド）、Mesh shader、PIX3 形式のマーカー
-6. フレーム内でのディスクリプタ書き換えを `draws` に反映、複数フレームキャプチャ
-7. 他プラットフォーム（[解析手順書](docs/reverse-engineering-guide.md) §9 のチェックリストに沿って追加）
+対応済み: シェーダシンボル、ExecuteIndirect、Enhanced Barriers、RenderPass、PipelineStateStream、Placed/Reserved、
+複数キュー、Bundle、Query、DXR、Mesh/Amplification、PIX3 マーカー、フレーム内ディスクリプタ書き換え、複数フレーム。
+
+残課題:
+1. PIX 独自レコードの未解明部分（❓）の解明（[wpix.md §5](docs/formats/wpix.md)）
+2. 未検証の引数種別（ExecuteIndirect の VB/IB/CBV 引数、フレーム内 BLAS ビルド、WorkGraphs など）
+3. PIX のシンボルサーバ問い合わせ形式との一致確認
+4. 他プラットフォーム（Nsight Graphics は NVIDIA GPU 環境が必要。[解析手順書](docs/reverse-engineering-guide.md) §9）
 
 ## 必要環境
 

@@ -50,6 +50,10 @@ public sealed class Struct
 
 public sealed class HeaderDb
 {
+    /// <summary>パーサの出力形式を変えたら上げる (キャッシュの自動再生成。Python 版 META_VERSION と揃える)</summary>
+    public const int MetaVersion = 2;
+
+    [JsonPropertyName("version")] public int Version { get; set; }   // キャッシュに無ければ 0 (= 再生成)
     [JsonPropertyName("interfaces")] public OrderedDictionary<string, Interface> Interfaces { get; set; } = new();
     [JsonPropertyName("structs")] public OrderedDictionary<string, Struct> Structs { get; set; } = new();
     [JsonPropertyName("enums")] public OrderedDictionary<string, OrderedDictionary<string, long>> Enums { get; set; } = new();
@@ -104,7 +108,10 @@ public sealed class HeaderDb
     {
         cachePath ??= DefaultCachePath;
         if (!rebuild && File.Exists(cachePath))
-            return JsonSerializer.Deserialize<HeaderDb>(File.ReadAllBytes(cachePath))!;
+        {
+            var cached = JsonSerializer.Deserialize<HeaderDb>(File.ReadAllBytes(cachePath));
+            if (cached is not null && cached.Version == MetaVersion) return cached;
+        }
         var inc = sdkInclude ?? FindSdkInclude();
         var files = DefaultHeaders.Select(h => Path.Combine(inc, h)).Where(File.Exists).ToList();
         var db = HeaderParser.Parse(files);
@@ -121,7 +128,8 @@ public static class HeaderParser
     private static readonly Regex ReMethod = new(
         @"DECLSPEC_XFGVIRT\((\w+),\s*(\w+)\)\s*(.*?)\(\s*STDMETHODCALLTYPE\s*\*\s*(\w+)\s*\)\s*\((.*?)\);", S);
     private static readonly Regex ReIid = new(@"MIDL_INTERFACE\(""([0-9A-Fa-f-]{36})""\)\s*\n\s*(\w+)\s*:", S);
-    private static readonly Regex ReStruct = new(@"typedef struct (\w+)\s*\{(.*?)\}\s*(\w+)\s*;", S);
+    private static readonly Regex ReStructHead = new(@"typedef struct (\w+)\s*\{", S);
+    private static readonly Regex ReTypedefName = new(@"^\s*(\w+)\s*;", S);
     private static readonly Regex ReEnum = new(@"typedef\s+enum\s+(\w+)\s*\{(.*?)\}\s*(\w+)\s*;", S);
     private static readonly Regex ReSal = new(@"^(_[A-Z][A-Za-z_]*_(?:\s*\((?:[^()]|\([^()]*\))*\))?)", S);
     private static readonly Regex ReComment = new(@"/\*.*?\*/|//[^\n]*", S);
@@ -178,7 +186,11 @@ public static class HeaderParser
         return outp;
     }
 
-    private static List<StructField> ParseStructBody(string body)
+    /// <summary>
+    /// 構造体本体をパースする。union { ... }; (無名) のメンバは同じ union 番号を持つ。
+    /// struct { ... } Name; (無名 struct の名前付きフィールド) は合成型 "&lt;owner&gt;.&lt;Name&gt;" として synth に登録する。
+    /// </summary>
+    private static List<StructField> ParseStructBody(string body, string owner, Dictionary<string, Struct> synth)
     {
         var fields = new List<StructField>();
         int unionId = 0;
@@ -200,7 +212,14 @@ public static class HeaderParser
                     }
                     var inner = text[(i + m.Length)..(j - 1)];
                     var endm = ReBlockEnd.Match(text[j..]);
-                    if (m.Groups[1].Value == "union") { unionId++; ParseBlock(inner, unionId); }
+                    var fname = endm.Success ? endm.Groups[1].Value : "";
+                    if (m.Groups[1].Value == "struct" && fname.Length > 0)
+                    {
+                        var tname = $"{owner}.{fname}";
+                        synth[tname] = new Struct { Name = tname, Fields = ParseStructBody(inner, tname, synth) };
+                        fields.Add(new StructField { Name = fname, Type = tname, Ptr = 0, Const = false, Array = "", Union = union });
+                    }
+                    else if (m.Groups[1].Value == "union") { unionId++; ParseBlock(inner, unionId); }
                     else ParseBlock(inner, union);
                     i = j + (endm.Success ? endm.Length : 0);
                     continue;
@@ -222,7 +241,7 @@ public static class HeaderParser
 
     public static HeaderDb Parse(IEnumerable<string> paths)
     {
-        var db = new HeaderDb();
+        var db = new HeaderDb { Version = HeaderDb.MetaVersion };
         var allConsts = new Dictionary<string, long>();
         foreach (var p in paths)
         {
@@ -252,10 +271,23 @@ public static class HeaderParser
                     });
                 }
             }
-            foreach (Match m in ReStruct.Matches(src))
+            foreach (Match m in ReStructHead.Matches(src))
             {
-                if (m.Groups[1].Value.EndsWith("Vtbl") || m.Groups[3].Value.EndsWith("Vtbl")) continue;
-                db.Structs[m.Groups[3].Value] = new Struct { Name = m.Groups[3].Value, Fields = ParseStructBody(m.Groups[2].Value) };
+                if (m.Groups[1].Value.EndsWith("Vtbl")) continue;
+                // 括弧の対応で本体の終わりを探す (入れ子の struct/union に対応)
+                int depth = 1, j = m.Index + m.Length;
+                while (depth > 0 && j < src.Length)
+                {
+                    if (src[j] == '{') depth++;
+                    else if (src[j] == '}') depth--;
+                    j++;
+                }
+                var tm = ReTypedefName.Match(src[j..Math.Min(src.Length, j + 256)]);
+                if (!tm.Success || tm.Groups[1].Value.EndsWith("Vtbl")) continue;
+                var name = tm.Groups[1].Value;
+                var synth = new Dictionary<string, Struct>();
+                db.Structs[name] = new Struct { Name = name, Fields = ParseStructBody(src[(m.Index + m.Length)..(j - 1)], name, synth) };
+                foreach (var kv in synth) db.Structs[kv.Key] = kv.Value;
             }
             foreach (Match m in ReEnum.Matches(src))
             {

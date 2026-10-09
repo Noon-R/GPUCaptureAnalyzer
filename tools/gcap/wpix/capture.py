@@ -51,22 +51,45 @@ class Capture:
     def failed(self) -> list[Call]:
         return [c for c in self.calls if not c.ok]
 
+    def _list_records(self, list_id: int, first: int, num: int) -> list[Call]:
+        """seq >= first で this == list_id のコマンドリスト呼び出しを先頭から num 件。
+        num は seq の範囲幅ではなく「そのリスト自身のレコード数」(間に Bundle の記録や PIX のスナップショット
+        レコードが挟まるため)。"""
+        if not hasattr(self, "_list_calls"):
+            self._list_calls: dict[int, list[Call]] = {}
+            for c in self.calls:   # calls は seq 順
+                if c.api.startswith("ID3D12GraphicsCommandList") and c.this is not None:
+                    self._list_calls.setdefault(c.this, []).append(c)
+                elif c.api == "PIX::PrepareForPresent":   # リストに属する PIX 独自イベント
+                    self._list_calls.setdefault(c.args.get("commandList"), []).append(c)
+        out = []
+        for c in self._list_calls.get(list_id, []):
+            if c.seq >= first:
+                out.append(c)
+                if len(out) == num:
+                    break
+        return out
+
     def command_lists(self) -> list[dict]:
         """ExecuteCommandLists を起点に、各コマンドリストの記録 (seq 範囲) を取り出す。"""
-        by_seq = {(c.seq, c.stream): c for c in self.calls}
-        list_stream = {c.stream for c in self.calls if c.api.startswith("ID3D12GraphicsCommandList::")}
         out = []
         for ecl in self.find("::ExecuteCommandLists"):
             for lst in ecl.args.get("lists", []):
-                cmds = []
-                for s in range(lst["firstSeq"], lst["firstSeq"] + lst["numRecords"]):
-                    for st in list_stream:
-                        c = by_seq.get((s, st))
-                        if c:
-                            cmds.append(c)
+                cmds = self._list_records(lst["list"], lst["firstSeq"], lst["numRecords"])
                 out.append({"queue": ecl.args.get("this"), "executeSeq": ecl.seq, "list": lst["list"],
                             "commands": cmds})
         return out
+
+    def bundle_commands(self, execute_bundle: Call) -> list[Call]:
+        """ExecuteBundle が実行する Bundle の記録 (Reset/Close を除く)。"""
+        info = execute_bundle.args.get("_pix") or {}
+        if "list" not in info:
+            return []
+        cmds = self._list_records(info["list"], info["firstSeq"], info["numRecords"])
+        return [c for c in cmds if c.api.split("::")[-1] not in ("Reset", "Close")]
+
+    def call_by_seq(self, seq: int, api: str) -> Call | None:
+        return next((c for c in self.calls if c.seq == seq and c.api == api), None)
 
     def resource_initial_data(self) -> Iterator[tuple[int, dict]]:
         """(resourceId, 2029 の args) を返す。args['data'] は bytes のまま保持するため生レコードから再デコード。"""

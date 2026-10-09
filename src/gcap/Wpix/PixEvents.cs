@@ -51,15 +51,10 @@ public static class PixEvents
         var o = new Obj { ["device"] = (long)r.U32(), ["resource"] = (long)r.U32() };
         o["heapProperties"] = d.ReadType(r, "D3D12_HEAP_PROPERTIES");
         o["heapFlags"] = (long)r.U32();
-        o["desc"] = d.ReadType(r, "D3D12_RESOURCE_DESC1");             // SamplerFeedbackMipRegion 付き (60B)
-        o["stateAtCaptureStart"] = (long)r.U32();                       // 作成時ではなくキャプチャ開始時のステート
-        o["optimizedClearValue"] = Opt(r, () => d.ReadType(r, "D3D12_CLEAR_VALUE")); // union 全メンバ
-        o["riid"] = r.Guid();
-        o["initialDataSeq"] = r.U64();                                  // 対応する 2029 レコードの seq
-        ulong n = r.U64();
-        var states = new List<object?>();
-        for (ulong i = 0; i < n; i++) states.Add((long)r.U32());
-        o["subresourceStatesAtCapture"] = states;
+        var desc = (Obj)d.ReadType(r, "D3D12_RESOURCE_DESC1")!;      // SamplerFeedbackMipRegion 付き (60B)
+        o["desc"] = desc;
+        PixEventsExt.ResourceStateAndTail(r, d, o, desc);              // ステート (またはレイアウト), ClearValue, riid, seq
+        PixEventsExt.SubresourceStates(r, d, o);
         d.NoteObject(o.GetLong("resource"), ("interface", "ID3D12Resource"), ("created_by", "PIX::CreateResource"),
                      ("desc", o["desc"]), ("heapType", o.GetObj("heapProperties")?.Get("Type")));
         return o;
@@ -187,6 +182,7 @@ public static class PixEvents
         d.Custom[2043] = ("PIX::Unknown2043", U32Only);
         d.Custom[2044] = ("PIX::DescriptorHeap", DescriptorHeap);
         // ExecuteCommandLists は汎用規則と異なる PIX 独自形式なので上書き
+        PixEventsExt.Register(d);
         if (d.Bases.TryGetValue("ID3D12CommandQueue", out var b))
             d.Custom[(uint)(b + 2)] = ("ID3D12CommandQueue::ExecuteCommandLists", ExecuteCommandLists);
     }
