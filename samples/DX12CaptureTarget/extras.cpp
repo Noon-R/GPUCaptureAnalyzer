@@ -728,7 +728,7 @@ void Extras::SubmitAsync(ID3D12CommandQueue* directQueue)
     }
 }
 
-void Extras::Record(ID3D12GraphicsCommandList* cl)
+void Extras::Record(ID3D12GraphicsCommandList* cl, bool inFrameRewrite)
 {
     ComPtr<ID3D12GraphicsCommandList4> cl4;
     ComPtr<ID3D12GraphicsCommandList6> cl6;
@@ -740,9 +740,15 @@ void Extras::Record(ID3D12GraphicsCommandList* cl)
     Pix3(cl, true, 0xFF00FF00ull, pix3Begin_.c_str(), pix3Begin_.size() + 1, true);
 
     // ---- フレーム内のディスクリプタ書き換え (キャプチャ開始時のスナップショットと異なる内容になる) ----
-    dev_->CreateShaderResourceView(texB_.Get(), nullptr, Cpu(heap_.Get(), kSlotTex0));
-    dev_->CopyDescriptorsSimple(1, Cpu(heap_.Get(), kSlotTex1), Cpu(cpuHeap_.Get(), 0),
-                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (inFrameRewrite) {
+        dev_->CreateShaderResourceView(texB_.Get(), nullptr, Cpu(heap_.Get(), kSlotTex0));
+        dev_->CopyDescriptorsSimple(1, Cpu(heap_.Get(), kSlotTex1), Cpu(cpuHeap_.Get(), 0),
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    } else {
+        // 前フレームは WaitIdle 済みなので GPU が参照中のディスクリプタを書き換えることはない
+        dev_->CreateShaderResourceView(texA_.Get(), nullptr, Cpu(heap_.Get(), kSlotTex0));
+        dev_->CreateShaderResourceView(texA_.Get(), nullptr, Cpu(heap_.Get(), kSlotTex1));
+    }
     ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
     cl->SetDescriptorHeaps(1, heaps);
 

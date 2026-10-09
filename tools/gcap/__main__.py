@@ -117,6 +117,15 @@ def cmd_cmdlists(a) -> None:
                     print(f"{ind}    | {bc.seq:5d} {bc.api.split('::')[-1]}({bargs})")
 
 
+def _placement(cap, o: dict) -> str:
+    """リソースの配置: committed はヒープ種別、placed は ID3D12Heap とオフセット、reserved はタイル。"""
+    if o.get("created_by") == "PIX::CreatePlacedResource":
+        return f"placed={cap.object_name(o['heap'])}+0x{o['heapOffset']:x}"
+    if o.get("created_by") == "PIX::CreateReservedResource":
+        return "reserved"
+    return f"heap={o.get('heapType')}"
+
+
 def cmd_objects(a) -> None:
     from .wpix.capture import Capture
     cap = Capture.open(a.file)
@@ -126,7 +135,7 @@ def cmd_objects(a) -> None:
         if "desc" in o and isinstance(o["desc"], dict) and "Dimension" in o["desc"]:
             dsc = o["desc"]
             extra = f" {dsc['Dimension'].replace('D3D12_RESOURCE_DIMENSION_', '')} {dsc['Width']}x{dsc['Height']} " \
-                    f"fmt={dsc['Format']} mips={dsc['MipLevels']} heap={o.get('heapType')}"
+                    f"fmt={dsc['Format']} mips={dsc['MipLevels']} {_placement(cap, o)}"
         print(f"#{oid:<4d} {o.get('interface', '?'):28s} {o.get('name') or '':32s}{extra}")
 
 

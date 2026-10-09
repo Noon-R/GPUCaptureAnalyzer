@@ -872,7 +872,9 @@ void App::RenderFrame(uint32_t frameIndex)
         cl->ResourceBarrier(1, &b);
     }
     PixEnd(cl);
-    if (extras_) extras_->Record(cl);
+    // キャプチャされるフレームだけディスクリプタを書き換える。CaptureNextFrame を frame N の直前に呼ぶと
+    // 実際にキャプチャされるのは N+1 から --capture-count 枚 (実験で確認)
+    if (extras_) extras_->Record(cl, frameIndex >= opt_.captureFrame + 1 && frameIndex < opt_.captureFrame + 1 + opt_.captureCount);
     PixEnd(cl);
 
     CHECK(cl->Close());
@@ -881,7 +883,6 @@ void App::RenderFrame(uint32_t frameIndex)
     queue_->ExecuteCommandLists(1, lists);
     CHECK(swapchain_->Present(1, 0));
     WaitIdle();
-    (void)frameIndex;
 }
 
 static void AppendJsonU32Array(std::string& s, const char* key, const uint32_t* v, int n)

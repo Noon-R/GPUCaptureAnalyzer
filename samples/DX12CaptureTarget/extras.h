@@ -27,7 +27,9 @@ public:
     // メインのコマンドリスト実行前に呼ぶ: Copy / Compute キューに投入し、direct キューに Wait を入れる
     void SubmitAsync(ID3D12CommandQueue* directQueue);
     // メインのコマンドリストに記録 (フレーム内のディスクリプタ書き換えもここで行う)
-    void Record(ID3D12GraphicsCommandList* cl);
+    // inFrameRewrite: true のフレームだけスロットを texB/texC に書き換える。false のフレームは texA に戻す
+    // (キャプチャ開始時のヒープ内容 = texA になり、フレーム内の書き換え追跡を検証できる)
+    void Record(ID3D12GraphicsCommandList* cl, bool inFrameRewrite);
     // manifest の "extras" オブジェクト (JSON 文字列) を返す
     std::string ManifestJson() const;
 

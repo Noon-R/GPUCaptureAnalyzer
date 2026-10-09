@@ -129,10 +129,20 @@ def _tile_mappings(r: Reader, d: "ApiDecoder") -> dict:
 
 
 def _accel_struct_data(r: Reader, d: "ApiDecoder") -> dict:
-    # 2041: 加速構造 (BLAS/TLAS) の内容。D3D12 のシリアライズ形式 (ドライバ依存の不透明データ) と推定
-    out: dict[str, Any] = {"unk0?": r.u64(), "resource": r.u32(), "size?": r.u32(), "unk1?": r.u32()}
+    # 2041: 加速構造 (BLAS/TLAS) の内容 = CopyRaytracingAccelerationStructure(SERIALIZE) の出力 (wpix.md §5)
+    out: dict[str, Any] = {"unk0?": r.u64(), "resource": r.u32(), "deserializedSize": r.u32(), "unk1?": r.u32()}
     blob = r.take(r.remaining())
-    out["driverMatchingGuid?"] = str(__import__("uuid").UUID(bytes_le=blob[:16])) if len(blob) >= 16 else None
+    if len(blob) >= 64:
+        h = Reader(blob)
+        out["header"] = {
+            "driverOpaqueGuid": str(__import__("uuid").UUID(bytes_le=h.take(16))),
+            "driverOpaqueVersioningData": h.take(16).hex(),
+            "unk?": h.u64(),
+            "serializedSizeInBytes": h.u64(),        # = blob 長 - 32 (ドライバ識別子の後から数える)
+            "deserializedSizeInBytes": h.u64(),      # = deserializedSize
+            "headerPostambleType?": h.u32(),         # BLAS/TLAS とも 0
+            "numBottomLevelPointers?": h.u32(),      # BLAS=0, TLAS=1 (このサンプルの TLAS は BLAS 1 個)
+        }
     out["serialized"] = blob
     return out
 
@@ -459,7 +469,7 @@ CUSTOM_EVENTS = [
     (2041, "PIX::AccelerationStructureData", _accel_struct_data),
     (2045, "PIX::CreateStateObject", _create_state_object),
     (2046, "PIX::QueryResults", _query_results),
-    (2139, "PIX::Unknown2139", _raw_event),
+    (2139, "PIX::ShaderTableRecords", _raw_event),
 ]
 
 

@@ -64,7 +64,7 @@ end-0x400 ファイルトレーラ (0x400 bytes, 末尾 "GFXB" "GFXA")
 | 1001 | コマンドリストの記録（direct/compute/copy 全コマンドリスト共通） |
 | 1002 | Bundle の記録 |
 | 2000 | コマンド実行時のスナップショット（間接引数, シェーダテーブル, TLAS インスタンス, Query 結果） |
-| 2001 | ExecuteCommandLists に付随する ❓ (2139) |
+| 2001 | ExecuteCommandLists に付随する（2139 = シェーダテーブルのレコード内容）🔶 |
 | 10000 / 10001 | 付随 blob の参照 / 本体（スクリーンショット PNG） |
 | 10002 | キャプチャ環境情報 |
 
@@ -139,10 +139,10 @@ base の間隔はヘッダ上のインターフェース順と完全には一致
 | 2037 | PIX::TileMappings | Reserved リソースのタイルマッピング（`u32 resource` + ❓） |
 | 2038 | PIX::ShaderTables | DispatchRays 実行時のシェーダテーブル（識別子 → エクスポート名）🔶 |
 | 2039 | PIX::InstanceDescs | TLAS ビルド時のインスタンス記述（§4.7） |
-| 2041 | PIX::AccelerationStructureData | 加速構造（BLAS/TLAS）の内容。`u64 ?, u32 resource, u32 size?, u32 ?` + D3D12 シリアライズ形式（ドライバ依存）🔶 |
+| 2041 | PIX::AccelerationStructureData | 加速構造（BLAS/TLAS）の内容。`u64 ?, u32 resource, u32 deserializedSize, u32 ?` + `CopyRaytracingAccelerationStructure(SERIALIZE)` 形式のデータ 🔶。データ先頭: GUID driverOpaqueGuid, u8[16] versioning, u64 ❓, u64 serializedSize（= データ長 − 32）, u64 deserializedSize（✅ 前半の値と一致）, u32 ❓(BLAS/TLAS とも 0), u32 BLAS ポインタ数?（BLAS=0, TLAS=1）, 以降ドライバ依存 |
 | 2045 | PIX::CreateStateObject | §3.7 |
 | 2046 | PIX::QueryResults | ResolveQueryData の結果: `u64 size + bytes`（u64 列） |
-| 2139 | PIX::Unknown2139 | ExecuteCommandLists 後に記録 ❓（4 バイトのハッシュ状の値を含む） |
+| 2139 | PIX::ShaderTableRecords | DispatchRays を含む ExecuteCommandLists 後に記録。シェーダテーブルのレコード内容のスナップショット 🔶（16 B ヘッダ ❓ の後、`u64 バイト数 + bytes` が RayGen(256) / Miss(192) / HitGroup(128) の順。サイズはサンプルのテーブルと一致）。デコードは raw のまま |
 
 > ⚠ 2042 にはマシン名・プロセス名・時刻が平文で入る。キャプチャを外部共有する際は注意。
 
@@ -329,6 +329,10 @@ u8 data[totalSize]                      ← GetCopyableFootprints のレイア�
 書き換えたスロットは書き換え後の内容で記録され、書き換え呼び出し自体はレコードとして現れない。
 （シェーダ可視ヒープのディスクリプタは実行時に読まれるため、GPU が見た内容と一致する）
 
+検証方法: サンプルはキャプチャされるフレームだけスロット 3/4 を texB/texC に書き換え、他のフレームでは texA に戻す。
+キャプチャ開始時点のヒープは texA だが、2044 には texB/texC が記録される（`--extras` キャプチャ、`draws` の t0/t1 で確認できる）。
+なお `CaptureNextFrame` を frame N の描画直前に呼ぶと、実際にキャプチャされるのは frame N+1 だった ✅（同じ実験で判明）。
+
 ```
 u32 ❓(=0), u32 device
 u8 present + D3D12_DESCRIPTOR_HEAP_DESC   (NodeMask は 1 を観測)
@@ -385,7 +389,7 @@ u8[16] ❓, u64 n,
 
 - ファイルヘッダ/セクショントレーラの各フィールド、`META` の 20 bytes、EVT ヘッダ reserved
 - D3D12CreateDevice (1566) 後半の caps 構造、2043
-- 2037（タイルマッピング）・2038（シェーダテーブル）の詳細構造、2041 の前半、2139、2030/2039/1629/2045 の ❓ 領域
+- 2037（タイルマッピング）・2038（シェーダテーブル）の詳細構造、2041 の ❓ 部分、2139 の 16 B ヘッダ、2030/2039/1629/2045 の ❓ 領域
 - BLAS をフレーム内でビルドするケース（`pGeometryDescs` のシリアライズ）、EmitPostbuildInfo / CopyRaytracingAccelerationStructure
 - 未検証の引数種別: ExecuteIndirect の VB/IB/CBV/SRV/UAV/DISPATCH_RAYS 引数、SUBOBJECT_TO_EXPORTS_ASSOCIATION、Sampler ヒープのスナップショット
 - WorkGraphs（DispatchGraph / SetProgram）、`WINPIX_EVENT_PIX3BLOB_V2` マーカー

@@ -194,6 +194,14 @@ public static class Program
         }
     }
 
+    // リソースの配置: committed はヒープ種別、placed は ID3D12Heap とオフセット、reserved はタイル
+    private static string Placement(Capture cap, Obj o) => o.GetStr("created_by") switch
+    {
+        "PIX::CreatePlacedResource" => $"placed={cap.ObjectName(o.GetLong("heap") ?? 0)}+0x{o.GetLong("heapOffset") ?? 0:x}",
+        "PIX::CreateReservedResource" => "reserved",
+        _ => $"heap={o.Get("heapType")}",
+    };
+
     private static void Objects(Capture cap)
     {
         foreach (var (oid, o) in cap.Objects)
@@ -201,7 +209,7 @@ public static class Program
             var extra = "";
             if (o.GetObj("desc") is { } d && d.ContainsKey("Dimension"))
                 extra = $" {d.GetStr("Dimension")?.Replace("D3D12_RESOURCE_DIMENSION_", "")} {d.Get("Width")}x{d.Get("Height")} " +
-                        $"fmt={d.Get("Format")} mips={d.Get("MipLevels")} heap={o.Get("heapType")}";
+                        $"fmt={d.Get("Format")} mips={d.Get("MipLevels")} {Placement(cap, o)}";
             Console.WriteLine($"#{oid,-4} {o.GetStr("interface") ?? "?",-28} {o.GetStr("name") ?? "",-32}{extra}");
         }
     }

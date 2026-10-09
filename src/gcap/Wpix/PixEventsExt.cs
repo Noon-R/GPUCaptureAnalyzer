@@ -80,9 +80,22 @@ public static class PixEventsExt
 
     public static Obj AccelStructData(ByteReader r, ApiDecoder d)
     {
-        var o = new Obj { ["unk0?"] = r.U64(), ["resource"] = (long)r.U32(), ["size?"] = (long)r.U32(), ["unk1?"] = (long)r.U32() };
+        var o = new Obj { ["unk0?"] = r.U64(), ["resource"] = (long)r.U32(), ["deserializedSize"] = (long)r.U32(), ["unk1?"] = (long)r.U32() };
         var blob = r.Take((long)r.Remaining);
-        o["driverMatchingGuid?"] = blob.Length >= 16 ? new Guid(blob.AsSpan(0, 16)).ToString("D") : null;
+        if (blob.Length >= 64)
+        {
+            var h = new ByteReader(blob);
+            o["header"] = new Obj
+            {
+                ["driverOpaqueGuid"] = new Guid(h.Take(16)).ToString("D"),
+                ["driverOpaqueVersioningData"] = Convert.ToHexString(h.Take(16)).ToLowerInvariant(),
+                ["unk?"] = h.U64(),
+                ["serializedSizeInBytes"] = h.U64(),      // = blob 長 - 32 (ドライバ識別子の後から数える)
+                ["deserializedSizeInBytes"] = h.U64(),    // = deserializedSize
+                ["headerPostambleType?"] = (long)h.U32(),      // BLAS/TLAS とも 0
+                ["numBottomLevelPointers?"] = (long)h.U32(),   // BLAS=0, TLAS=1 (このサンプルの TLAS は BLAS 1 個)
+            };
+        }
         o["serialized"] = blob;
         return o;
     }
@@ -326,6 +339,6 @@ public static class PixEventsExt
         d.Custom[2041] = ("PIX::AccelerationStructureData", AccelStructData);
         d.Custom[2045] = ("PIX::CreateStateObject", CreateStateObject);
         d.Custom[2046] = ("PIX::QueryResults", QueryResults);
-        d.Custom[2139] = ("PIX::Unknown2139", RawEvent);
+        d.Custom[2139] = ("PIX::ShaderTableRecords", RawEvent);
     }
 }
