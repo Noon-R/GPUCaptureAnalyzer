@@ -3,6 +3,9 @@
 GPU キャプチャファイル（PIX `.wpix`、将来的に Nsight Graphics）のバイナリを独自にデコードし、
 PIX などの GUI/CLI では取り出しにくい情報を自動解析できるようにするプロジェクト。
 
+- **本体: `gcap.exe`（C# / .NET 10、単一ファイル exe・ランタイム同梱）**
+- 検証用リファレンス実装: `tools/gcap`（Python。解析作業用ツールと、C# 版との出力照合に使う）
+
 ## 現在できること（PIX 2603.25 / D3D12）
 
 - `.wpix` コンテナの完全パース（XPRESS 圧縮ブロックの展開、ストリーム/ディレクトリ構造）
@@ -12,63 +15,69 @@ PIX などの GUI/CLI では取り出しにくい情報を自動解析できる�
 - **Draw/Dispatch 毎のバインディング解決**（ルートシグネチャ blob を解析し、ディスクリプタテーブル → 実リソース、VB/IB、RTV/DSV を特定）
 - キャプチャ開始時点のリソース内容・ステート・ディスクリプタヒープのスナップショット
 - リソース初期データ / シェーダバイトコード / ルートシグネチャ / スクリーンショットの抽出
-- 未知形式向けのバイナリ調査ツール（エントロピー、タグ、既知値検索、圧縮総当たり）
+- 未知形式向けのバイナリ調査ツール（Python 版のみ: エントロピー、タグ、既知値検索、圧縮総当たり）
 
 **解析手順書（他プラットフォームにも適用可）: [docs/reverse-engineering-guide.md](docs/reverse-engineering-guide.md)**
 
 フォーマットの詳細: [docs/formats/wpix.md](docs/formats/wpix.md) / 作業ループ: [docs/methodology.md](docs/methodology.md) /
 Nsight の状況: [docs/formats/nsight.md](docs/formats/nsight.md)
 
+## 使い方（gcap.exe）
+
+```bash
+# ビルド (dist/gcap.exe が生成される)
+dotnet publish src/gcap -c Release -o dist
+
+gcap wpix info     capture.wpix              # コンテナ/ストリーム概要
+gcap wpix calls    capture.wpix [--json]     # 全 API 呼び出し (--json で JSON Lines, --failed で失敗のみ)
+gcap wpix cmdlists capture.wpix              # コマンドリスト毎・マーカー階層付き
+gcap wpix objects  capture.wpix              # オブジェクト一覧 (名前・型・リソース desc)
+gcap wpix draws    capture.wpix [--json]     # Draw/Dispatch 毎の PSO・ルート引数・実リソース
+gcap wpix extract  capture.wpix -o outdir    # リソース初期データ/シェーダ/ルートシグネチャ/スクリーンショット
+gcap meta rebuild                            # Windows SDK ヘッダから型メタデータを再生成
+```
+
+- 初回実行時に Windows SDK のヘッダ（d3d12.h 等）から型メタデータを生成し、`%LOCALAPPDATA%\gcap\d3d12_meta.json` にキャッシュする。
+  SDK が別の場所にある場合は環境変数 `GCAP_SDK_INCLUDE`（`...\Windows Kits\10\Include\<ver>`）か `meta rebuild --sdk` で指定する。
+- 任意のアプリのキャプチャ（PIX GUI で保存した .wpix）も同じコマンドで解析できる。
+  未対応 API は `Unknown_<typeId>` または `!! ... bytes left over` として表示される。
+
 ## 構成
 
 ```
+src/gcap/                    本体 (C#)。Program.cs (CLI), Wpix/ (コンテナ・デコーダ・PIX 独自イベント・状態解決), Meta/ (SDK ヘッダ解析)
+tools/gcap/                  Python リファレンス実装 + 解析用ツール (inspect: hexdump/差分, probe: 未知形式調査)
+  wpix/knowledge/            解析で判明した知識 (typeId base 表)。C# 版にも埋め込まれる単一の情報源
 samples/DX12CaptureTarget/   既知の値を埋め込んだ DX12 テストアプリ (variant で値が変化, manifest 出力, PIX プログラマティックキャプチャ)
 scripts/capture_pix.py       variant 毎にキャプチャ + pixtool で正解データ (event list / export-to-cpp) を生成
-tools/gcap/                  解析ツール (Python 3.11+, 外部依存なし, Windows)
-  wincompress.py             Windows Compression API (cabinet.dll) ラッパ
-  d3dmeta/header_parser.py   Windows SDK ヘッダ → インターフェース/構造体/enum メタデータ (d3d12_meta.json)
-  wpix/container.py          ファイル/セクション/ディレクトリ/ブロック層
-  wpix/events.py             <EVT レコード層
-  wpix/decoder.py            汎用 API デコーダ (シリアライズ規則)
-  wpix/pix_events.py         PIX 独自イベント (リソース生成/初期データ/ディスクリプタヒープ/...)
-  wpix/knowledge/            解析で判明した知識 (typeId base 表)
-  wpix/capture.py            高レベル API
-  wpix/inspect.py            解析用 hexdump / 差分
-  wpix/state.py              コマンドリスト再生 → Draw/Dispatch 毎のバインディング解決
-  rootsig.py                 シリアライズ済みルートシグネチャ (RTS0) パーサ
-  probe.py                   形式非依存のバイナリ調査
-tests/test_wpix.py           manifest 照合 + export-to-cpp 照合の回帰テスト
+tests/test_wpix.py           Python 版: manifest 照合 + export-to-cpp 照合
+tests/test_csharp_parity.py  C# 版 == Python 版 (calls / draws / extract の出力一致)
 docs/                        フォーマット仕様・手法
 captures/                    キャプチャ置き場 (git 管理外)
 ```
 
-## 使い方
+## 開発
 
 ```bash
-# サンプルアプリのビルド (VS 2026 / Windows SDK 10.0.26100)
+# テストアプリのビルド (VS 2026 / Windows SDK 10.0.26100)
 cmake -S samples/DX12CaptureTarget -B samples/DX12CaptureTarget/build -G "Visual Studio 18 2026" -A x64
 cmake --build samples/DX12CaptureTarget/build --config Release
 
 # キャプチャ取得 (variant 0..3) + pixtool による正解データ生成
 python scripts/capture_pix.py --variants 0 1 2 3
 
-# 解析
+# 解析作業用 (Python)
 cd tools
-python -m gcap wpix info     ../captures/pix/v0.wpix     # コンテナ/ストリーム概要
-python -m gcap wpix calls    ../captures/pix/v0.wpix     # 全 API 呼び出し (--json で JSON Lines)
-python -m gcap wpix cmdlists ../captures/pix/v0.wpix     # コマンドリスト毎・マーカー階層付き
-python -m gcap wpix objects  ../captures/pix/v0.wpix     # オブジェクト一覧 (名前・型・リソース desc)
-python -m gcap wpix draws    ../captures/pix/v0.wpix     # Draw/Dispatch 毎の PSO・ルート引数・実リソース (--json)
-python -m gcap wpix extract  ../captures/pix/v0.wpix -o ../captures/pix/v0_extract
-python -m gcap probe FILE --manifest known.json          # 未知形式の初期調査
+python -m gcap wpix calls ../captures/pix/v0.wpix --failed
+python -m gcap.wpix.inspect ../captures/pix/v0.wpix ../captures/pix/v1.wpix --seq 67 --diff
+python -m gcap probe FILE --manifest known.json
 
-# テスト
-cd .. && python -m unittest discover -s tests -v
+# テスト (Python 版の正しさ + C# 版との一致)
+cd .. && dotnet publish src/gcap -c Release -o dist && python -m unittest discover -s tests -v
 ```
 
-任意のアプリのキャプチャ（PIX GUI で保存した .wpix）も同じコマンドで解析できる。
-未対応 API は `Unknown_<typeId>` または `!! ... bytes left over` として表示されるので、
-[docs/methodology.md](docs/methodology.md) の手順でカバー範囲を広げる。
+デコード規則を変えるときは **Python 版と C# 版の両方**を直し、`test_csharp_parity` で一致を確認する
+（手順は [docs/methodology.md](docs/methodology.md)）。
 
 ## 注意
 
@@ -79,15 +88,17 @@ cd .. && python -m unittest discover -s tests -v
 
 当面は PIX (.wpix) の対応範囲を広げる。Nsight Graphics は NVIDIA GPU 環境の用意後に着手する。
 
-1. ExecuteIndirect / CommandSignature、Enhanced Barriers (`Barrier`)、RenderPass
-2. PipelineStateStream (`CreatePipelineState`)、Placed / Reserved リソース、CopyDescriptors
-3. 複数キュー（Copy / Compute）・複数コマンドリスト・Bundle・Query
-4. DXR（`DispatchRays`、AS ビルド）、Mesh shader、PIX3 形式のマーカー
-5. フレーム内でのディスクリプタ書き換えを `draws` に反映、複数フレームキャプチャ
-6. 他プラットフォーム（[解析手順書](docs/reverse-engineering-guide.md) §9 のチェックリストに沿って追加）
+1. **シェーダシンボル**: シンボルサーバ / キャプチャと同じフォルダ / 指定フォルダを再帰探索して PDB を照合
+   （必要分が見つかった時点で打ち切り）。見つからないシェーダは IL（DXIL/DXBC 逆アセンブル）で書き出す
+2. ExecuteIndirect / CommandSignature、Enhanced Barriers (`Barrier`)、RenderPass
+3. PipelineStateStream (`CreatePipelineState`)、Placed / Reserved リソース、CopyDescriptors
+4. 複数キュー（Copy / Compute）・複数コマンドリスト・Bundle・Query
+5. DXR（`DispatchRays`、AS ビルド）、Mesh shader、PIX3 形式のマーカー
+6. フレーム内でのディスクリプタ書き換えを `draws` に反映、複数フレームキャプチャ
+7. 他プラットフォーム（[解析手順書](docs/reverse-engineering-guide.md) §9 のチェックリストに沿って追加）
 
 ## 必要環境
 
-- Windows 10/11、Python 3.11+（外部パッケージ不要）
-- キャプチャ取得とテストアプリのビルドには PIX on Windows、Visual Studio、Windows SDK が必要
-- `tools/gcap/d3dmeta/d3d12_meta.json` は初回実行時に Windows SDK のヘッダから自動生成される（`python -m gcap meta rebuild` でも可）
+- 実行: Windows 10/11 (x64)、Windows SDK（型メタデータ生成用のヘッダ）。`gcap.exe` は .NET ランタイム不要
+- ビルド: .NET 10 SDK
+- 解析作業・テスト: Python 3.11+（外部パッケージ不要）、PIX on Windows、Visual Studio

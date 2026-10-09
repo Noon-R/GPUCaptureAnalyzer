@@ -4,3 +4,6 @@ samples/**/build/
 __pycache__/
 *.pyc
 tools/gcap/d3dmeta/d3d12_meta.json
+dist/
+src/**/bin/
+src/**/obj/

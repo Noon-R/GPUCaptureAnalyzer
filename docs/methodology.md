@@ -39,9 +39,10 @@ python -m gcap wpix calls ../captures/pix/v0.wpix --failed
 # 4. 生バイトと差分を見る
 python -m gcap.wpix.inspect ../captures/pix/v0.wpix --seq 67
 python -m gcap.wpix.inspect ../captures/pix/v0.wpix ../captures/pix/v1.wpix --seq 67 --diff
-# 5. 規則を decoder.py / pix_events.py / knowledge/type_bases.json に反映
-# 6. tests/test_wpix.py に manifest 照合を追加して回帰テスト
-cd .. && python -m unittest discover -s tests -v
+# 5. 規則を Python (tools/gcap/wpix/decoder.py, pix_events.py) と C# (src/gcap/Wpix/ApiDecoder.cs, PixEvents.cs) の両方に反映
+#    typeId base は tools/gcap/wpix/knowledge/type_bases.json (両者で共有)
+# 6. tests/test_wpix.py に manifest 照合を追加し、C# 版を再ビルドして全テスト (C#/Python 一致を含む)
+cd .. && dotnet publish src/gcap -c Release -o dist && python -m unittest discover -s tests -v
 # 7. docs/formats/wpix.md を更新（確度マーク付き）
 ```
 
