@@ -299,7 +299,8 @@ section <CAP> version=2 offset=0x400 size=0xe08e
      "heapSlot": 5,
      "kind": "UAV",
      "resource": "#57(GCA_RTOutput)",
-     "view": null
+     "view": null,
+     "used": null
     }
    ]
   },

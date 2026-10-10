@@ -22,8 +22,23 @@ public sealed class Obj : OrderedDictionary<string, object?>
     public long? ObjId(string key) => GetObj(key)?.GetLong("obj");
 }
 
+/// <summary>
+/// 大きなバイト列 (リソース初期データ, アップロードヒープのページ等) の遅延参照。
+/// デコード結果に実体を持たせると実ゲームのキャプチャでメモリが足りなくなるため、必要時に読み直す。
+/// JSON 等の表示は byte[] と同じ (先頭 64B だけ保持)。
+/// </summary>
+public sealed class LazyBytes(long length, byte[] head, Func<byte[]> load)
+{
+    public long Length { get; } = length;
+    public byte[] Head { get; } = head;
+    public byte[] Load() => load();
+}
+
 public static class V
 {
+    /// <summary>byte[] / LazyBytes を実体化する (それ以外は null)。</summary>
+    public static byte[]? Bytes(object? o) => o switch { byte[] b => b, LazyBytes l => l.Load(), _ => null };
+
     public static long? ToLong(object? o) => o switch
     {
         long l => l,
@@ -72,6 +87,16 @@ public static class V
                     w.WriteEndObject();
                 }
                 else w.WriteStringValue(Hex(bytes));
+                break;
+            case LazyBytes lb:
+                if (shortBytes)
+                {
+                    w.WriteStartObject();
+                    w.WriteNumber("bytes", lb.Length);
+                    w.WriteString("hex", Hex(lb.Head) + (lb.Length > 64 ? "..." : ""));
+                    w.WriteEndObject();
+                }
+                else w.WriteStringValue(Hex(lb.Load()));
                 break;
             case Obj o:
                 w.WriteStartObject();

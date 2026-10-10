@@ -1,3 +1,4 @@
+using Gcap.Shaders;
 using Gcap.Util;
 
 namespace Gcap.Wpix;
@@ -8,7 +9,8 @@ namespace Gcap.Wpix;
 ///   * Draw*/Dispatch/DispatchMesh/DispatchRays/ExecuteIndirect (間接引数は PIX::IndirectArguments から展開)
 ///   * Bundle (ExecuteBundle は呼び出し元の状態を継承して中身を再生)
 ///   * RenderPass (BeginRenderPass の RT/DS を出力先として扱う)
-/// ディスクリプタヒープの内容は PIX::DescriptorHeap のスナップショット (実行時点の内容。フレーム内の書き換えを反映済み)。
+/// ディスクリプタヒープの内容 = PIX::DescriptorHeap (2044) のスナップショット + PIX::WriteDescriptors (2033) の書き込みのうち
+/// そのコマンドリストを実行する ExecuteCommandLists より前のもの (GPU は実行時にディスクリプタを読むため)。
 /// </summary>
 public sealed class DrawAnalyzer
 {
@@ -18,7 +20,18 @@ public sealed class DrawAnalyzer
 
     private readonly Capture _cap;
     private readonly Dictionary<long, Obj> _rootsigs = [];
-    private readonly Dictionary<long, List<object?>> _heaps = [];
+    private readonly Dictionary<long, Dictionary<long, Obj>> _heaps = [];   // heap -> {slot: descriptor}
+    private readonly Dictionary<long, long> _heapSize = [];                    // heap -> 既知の最大スロット + 1 (上限なしレンジ用)
+    private readonly Dictionary<long, Dictionary<string, List<ShaderReflection.Binding>?>> _psoBindings = [];   // PSO -> {ステージ: 使うバインディング}
+    private static readonly string[] ShaderStages = ["VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS"];
+    // ルートパラメータの ShaderVisibility -> そのパラメータが見えるステージ
+    private static readonly Dictionary<string, string[]> VisibleStages = new()
+    {
+        ["ALL"] = ShaderStages, ["VERTEX"] = ["VS"], ["HULL"] = ["HS"], ["DOMAIN"] = ["DS"], ["GEOMETRY"] = ["GS"],
+        ["PIXEL"] = ["PS"], ["AMPLIFICATION"] = ["AS"], ["MESH"] = ["MS"],
+    };
+    private readonly List<Call> _writes = [];                                  // 2033 (seq 順)
+    private int _nextWrite;
 
     private sealed class State
     {
@@ -48,17 +61,48 @@ public sealed class DrawAnalyzer
                     catch (Exception) { /* 解析不能な blob は無視 */ }
                 }
             }
+            else if (c.Ok && c.Api.EndsWith("PipelineState") && c.Method.StartsWith("Create") && c.Args.ObjId("ppPipelineState") is long pso)
+            {
+                var desc = c.Args.GetObj("pDesc");
+                var stages = new Dictionary<string, List<ShaderReflection.Binding>?>();
+                foreach (var stage in ShaderStages)
+                    if (desc?.GetObj(stage)?.Get("pShaderBytecode") is byte[] bc && bc.Length > 0)
+                        stages[stage] = ShaderReflection.UsedBindings(bc);
+                _psoBindings[pso] = stages;
+            }
             else if (c.Api == "PIX::DescriptorHeap" && c.Args.GetLong("ppHeap") is long heap)
-                _heaps[heap] = c.Args.GetList("descriptors") ?? [];
+            {
+                var slots = new Dictionary<long, Obj>();
+                var list = c.Args.GetList("descriptors") ?? [];
+                for (int i = 0; i < list.Count; i++) slots[i] = list[i] as Obj ?? new Obj();
+                _heaps[heap] = slots;
+                _heapSize[heap] = list.Count;
+            }
+            else if (c.Api == "PIX::WriteDescriptors" && c.Ok) _writes.Add(c);
+        }
+    }
+
+    /// <summary>seq &lt; beforeSeq の 2033 を適用する (コマンドリストは ExecuteCommandLists の seq 順に処理される)。</summary>
+    private void ApplyWrites(ulong beforeSeq)
+    {
+        for (; _nextWrite < _writes.Count && _writes[_nextWrite].Seq < beforeSeq; _nextWrite++)
+        {
+            var a = _writes[_nextWrite].Args;
+            long heapId = a.GetLong("heap") ?? 0, index = a.GetLong("index") ?? 0;
+            if (!_heaps.TryGetValue(heapId, out var heap)) _heaps[heapId] = heap = [];
+            var descs = a.GetList("descriptors") ?? [];
+            for (int i = 0; i < descs.Count; i++) heap[index + i] = descs[i] as Obj ?? new Obj();
+            _heapSize[heapId] = Math.Max(_heapSize.GetValueOrDefault(heapId), index + descs.Count);
         }
     }
 
     private string Name(long? oid) => _cap.ObjectName(oid);
 
-    private List<object?> ResolveTable(Obj? rs, long paramIndex, Obj handle)
+    private List<object?> ResolveTable(Obj? rs, long paramIndex, Obj handle, List<ShaderReflection.Binding>? used)
     {
         long heapId = handle.GetLong("heap") ?? 0, index = handle.GetLong("index") ?? 0;
         var heap = _heaps.GetValueOrDefault(heapId) ?? [];
+        long size = _heapSize.GetValueOrDefault(heapId);
         var outp = new List<object?>();
         var ranges = new List<Obj>();
         var pars = rs?.GetList("parameters");
@@ -69,11 +113,11 @@ public sealed class DrawAnalyzer
         foreach (var rg in ranges)
         {
             long num = rg.GetLong("num") ?? 1, off = rg.GetLong("offset") ?? 0;
-            if (num == 0xFFFFFFFF) num = Math.Max(0, heap.Count - index - off);
+            if (num == 0xFFFFFFFF) num = Math.Max(0, size - index - off);
             for (long k = 0; k < Math.Min(num, 64); k++)
             {
                 long slot = index + off + k;
-                var d = slot < heap.Count ? heap[(int)slot] as Obj ?? new Obj() : new Obj { ["kind"] = "OutOfSnapshot" };
+                var d = heap.TryGetValue(slot, out var hd) ? hd : new Obj { ["kind"] = "OutOfSnapshot" };
                 var bas = rg.GetLong("baseRegister");
                 string? reg = bas is null ? null : $"{RegPrefix.GetValueOrDefault(rg.GetStr("type") ?? "", "?")}{bas + k}";
                 var res = d.GetLong("resource");
@@ -81,13 +125,28 @@ public sealed class DrawAnalyzer
                 {
                     ["register"] = reg, ["space"] = rg.Get("space"), ["heapSlot"] = slot, ["kind"] = d.Get("kind"),
                     ["resource"] = res is long r && r != 0 ? Name(r) : null, ["view"] = d.Get("view"),
+                    ["used"] = ShaderReflection.IsUsed(used, reg, rg.GetLong("space")),
                 });
             }
         }
         return outp;
     }
 
-    private List<object?> Bindings(State st, string pipe)
+    /// <summary>visibility のステージが使うバインディングの和。PSO 不明・判定できないステージがあれば null。</summary>
+    private static List<ShaderReflection.Binding>? VisibleBindings(Dictionary<string, List<ShaderReflection.Binding>?>? stages, string? visibility)
+    {
+        if (stages is null) return null;
+        var outp = new List<ShaderReflection.Binding>();
+        foreach (var s in VisibleStages.GetValueOrDefault(visibility ?? "ALL", ShaderStages))
+        {
+            if (!stages.TryGetValue(s, out var b)) continue;
+            if (b is null) return null;
+            outp.AddRange(b);
+        }
+        return outp;
+    }
+
+    private List<object?> Bindings(State st, string pipe, Dictionary<string, List<ShaderReflection.Binding>?>? stages)
     {
         var rsId = st.RootSig[pipe];
         var rs = rsId is long id ? _rootsigs.GetValueOrDefault(id) : null;
@@ -97,7 +156,9 @@ public sealed class DrawAnalyzer
         {
             var p = pars is not null && idx < pars.Count ? pars[(int)idx] as Obj ?? new Obj() : new Obj();
             var b = new Obj { ["rootParam"] = idx, ["type"] = kind, ["visibility"] = p.Get("visibility") };
-            if (kind == "table") b["descriptors"] = ResolveTable(rs, idx, (Obj)val!);
+            // compute パイプラインでは ShaderVisibility に関係なく CS が全パラメータを見る
+            if (kind == "table")
+                b["descriptors"] = ResolveTable(rs, idx, (Obj)val!, VisibleBindings(stages, pipe == "Compute" ? "ALL" : p.GetStr("visibility")));
             else if (kind == "constants")
             {
                 b["register"] = p.ContainsKey("register") ? $"b{p.GetLong("register")}" : null;
@@ -248,7 +309,9 @@ public sealed class DrawAnalyzer
                         ["seq"] = c.Seq, ["queue"] = Name(cl.Queue), ["commandList"] = Name(cl.List), ["bundle"] = bundle,
                         ["call"] = m, ["args"] = args,
                         ["pso"] = Name(m == "DispatchRays" ? st.StateObject : st.Pso),
-                        ["rootSignature"] = Name(st.RootSig[pipe]), ["bindings"] = Bindings(st, pipe),
+                        // DispatchRays はステートオブジェクト (ライブラリ) なので使用判定しない
+                        ["rootSignature"] = Name(st.RootSig[pipe]),
+                        ["bindings"] = Bindings(st, pipe, m == "DispatchRays" || st.Pso is not long p ? null : _psoBindings.GetValueOrDefault(p)),
                     };
                     if (m == "DispatchRays") d["shaderTableExports"] = ShaderTableExports(c);
                     if (m == "ExecuteIndirect") d["indirectCommands"] = indirect;
@@ -275,6 +338,7 @@ public sealed class DrawAnalyzer
         var draws = new List<Obj>();
         foreach (var cl in _cap.CommandLists())
         {
+            ApplyWrites(cl.ExecuteSeq);
             var st = new State();
             foreach (var c in cl.Commands) st = Process(c, st, cl, draws);
         }

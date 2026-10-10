@@ -76,7 +76,7 @@ CPU_HANDLE_KIND_BY_PARAM = {
 }
 
 # CBV_SRV_UAV / SAMPLER ヒープ上のディスクリプタ種別 (u32)。PIX 独自の列挙
-DESCRIPTOR_KIND = {0: "Empty", 1: "CBV", 2: "SRV", 3: "UAV", 4: "Sampler?", 5: "RTV?", 6: "DSV?"}
+DESCRIPTOR_KIND = {0: "Empty", 1: "CBV", 2: "SRV", 3: "UAV", 6: "Sampler"}   # 4, 5 は未観測
 
 
 # SAL 上は単一ポインタだが PIX は配列 (present + u64 count + 要素) として記録する引数
@@ -288,7 +288,7 @@ class ApiDecoder:
         raise DecodeError(f"cpu descriptor handle in unknown context ({kind})")
 
     def read_descriptor(self, r: Reader) -> dict:
-        """CBV_SRV_UAV ヒープのディスクリプタ: u32 種別 + 内容。PIX::DescriptorHeap(2044) でも同じ形式。"""
+        """シェーダ可視ヒープのディスクリプタ: u32 種別 + 内容。PIX::DescriptorHeap(2044) / WriteDescriptors(2033) で共通。"""
         k = r.u32()
         kind = DESCRIPTOR_KIND.get(k, str(k))
         out: dict[str, Any] = {"kind": kind}
@@ -296,6 +296,9 @@ class ApiDecoder:
             return out
         if k == 1:
             out["view"] = self.read_type(r, "D3D12_CONSTANT_BUFFER_VIEW_DESC") if r.flag() else None
+            return out
+        if k == 6:   # Sampler ヒープ (UE5 キャプチャで観測)
+            out["view"] = self.read_type(r, "D3D12_SAMPLER_DESC") if r.flag() else None
             return out
         if k == 2:
             out["view"] = self.read_type(r, "D3D12_SHADER_RESOURCE_VIEW_DESC") if r.flag() else None

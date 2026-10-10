@@ -71,7 +71,7 @@ public static class PixEvents
         o["footprints"] = fps;
         ulong size = r.U64();
         o["size"] = size;
-        o["data"] = r.Take(size);
+        o["data"] = d.TakeBlob(r, size);
         return o;
     }
 
@@ -167,6 +167,49 @@ public static class PixEvents
         return o;
     }
 
+    // 2033: フレーム中のディスクリプタヒープへの書き込み (heap[index .. index+count) の新しい内容)
+    private static Obj WriteDescriptors(ByteReader r, ApiDecoder d)
+    {
+        var o = new Obj { ["unk0"] = (long)r.U32(), ["heap"] = (long)r.U32(), ["index"] = (long)r.U32(), ["count"] = (long)r.U32() };
+        List<object?>? descs = null;
+        if (r.Flag())
+        {
+            ulong n = r.U64();
+            descs = [];
+            for (ulong i = 0; i < n; i++) descs.Add(d.ReadDescriptor(r));
+        }
+        o["descriptors"] = descs;
+        return o;
+    }
+
+    // 2034: CPU が書き込んだ (Map された) アップロードヒープのページ内容 (コマンドリストの Reset の直前)
+    //   u32 0, u64 M, M x {u64 resource, u64 N, N x {u64 page, u64 size, u8[size], u64 size}, u64 N}, u32 M
+    private static Obj UploadPages(ByteReader r, ApiDecoder d)
+    {
+        var o = new Obj { ["unk0"] = (long)r.U32() };
+        var entries = new List<object?>();
+        ulong m = r.U64();
+        for (ulong i = 0; i < m; i++)
+        {
+            var e = new Obj { ["resource"] = r.U64() };
+            var pages = new List<object?>();
+            ulong n = r.U64();
+            for (ulong j = 0; j < n; j++)
+            {
+                ulong page = r.U64(), size = r.U64();
+                var data = d.TakeBlob(r, size);
+                if (r.U64() != size) throw new DecodeException("2034: page size mismatch");
+                pages.Add(new Obj { ["page"] = page, ["offset"] = page * size, ["data"] = data });
+            }
+            if (r.U64() != n) throw new DecodeException("2034: page count mismatch");
+            e["pages"] = pages;
+            entries.Add(e);
+        }
+        o["entries"] = entries;
+        if (r.U32() != m) throw new DecodeException("2034: entry count mismatch");
+        return o;
+    }
+
     private static Obj U32Only(ByteReader r, ApiDecoder d) => new() { ["value"] = (long)r.U32() };
 
     public static void Register(ApiDecoder d)
@@ -181,6 +224,8 @@ public static class PixEvents
         d.Custom[2042] = ("PIX::CaptureEnvironment", CaptureEnvironment);
         d.Custom[2043] = ("PIX::Unknown2043", U32Only);
         d.Custom[2044] = ("PIX::DescriptorHeap", DescriptorHeap);
+        d.Custom[2033] = ("PIX::WriteDescriptors", WriteDescriptors);
+        d.Custom[2034] = ("PIX::UploadPages", UploadPages);
         // ExecuteCommandLists は汎用規則と異なる PIX 独自形式なので上書き
         PixEventsExt.Register(d);
         if (d.Bases.TryGetValue("ID3D12CommandQueue", out var b))

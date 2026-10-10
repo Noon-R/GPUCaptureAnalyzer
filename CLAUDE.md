@@ -36,5 +36,10 @@ GPU キャプチャ (PIX .wpix / 将来 Nsight Graphics) のバイナリを独�
 - ECL の `numRecords` は seq 幅ではなくリスト自身のレコード数（Bundle/スナップショットが間に挟まる）。リストは `this` で絞る
 - 型メタデータの形式を変えたら `META_VERSION`（Python）/ `HeaderDb.MetaVersion`（C#）を上げる（古いキャッシュを自動再生成）
 - `dist/gcap.exe` の再ビルドを忘れると parity テストが古い exe と比較する
+- 実アプリ検証: `python scripts/capture_app.py Game.exe --args "-dx12"` → `captures/real/`、`tests/test_real_world.py`。
+  未知 typeId は pixtool のイベント一覧の API 別件数と突き合わせると特定しやすい
+- 大きなストリーム (UE5 で展開後 2.5GB) があるので C# はストリームを丸ごと展開しない (`WpixStream.Read` / `LazyBytes`)。
+  大きなデータは `ApiDecoder.TakeBlob` で読む。成功したレコードの生バイトは保持しない
+- draws のディスクリプタ = 2044 + ExecuteCommandLists より前の 2033。`used` は PSV0/RDEF とルートパラメータの可視性で判定
 - `captures/` は生成物（git 管理外）。キャプチャにはマシン名等が含まれる
 - Bash ツールのヒアドキュメントで `'` を多く含む Python を流すと失敗することがある → スクリプトは scratchpad に Write してから実行

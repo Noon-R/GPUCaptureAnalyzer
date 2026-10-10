@@ -60,13 +60,16 @@ end-0x400 ファイルトレーラ (0x400 bytes, 末尾 "GFXB" "GFXA")
 | 100 / 101 | リソース生成 (1700/1767/1770) / リソース初期内容 (2029) |
 | 102 / 103 | タイルマッピング (2037) / 加速構造データ (2041) |
 | 300 | SetName |
-| 1000 | キュー操作 (ExecuteCommandLists, Signal, Wait, UpdateTileMappings, Present) |
+| 1000 | キュー操作 (ExecuteCommandLists, Signal, Wait, UpdateTileMappings, Present) + ディスクリプタ書き込み (2033) + アップロードヒープのページ (2034) |
 | 1001 | コマンドリストの記録（direct/compute/copy 全コマンドリスト共通） |
 | 1002 | Bundle の記録 |
 | 2000 | コマンド実行時のスナップショット（間接引数, シェーダテーブル, TLAS インスタンス, Query 結果） |
 | 2001 | ExecuteCommandLists に付随する（2139 = シェーダテーブルのレコード内容）🔶 |
 | 10000 / 10001 | 付随 blob の参照 / 本体（スクリーンショット PNG） |
 | 10002 | キャプチャ環境情報 |
+
+実ゲーム（UE5, 1 フレーム）では stream 101（リソース初期データ）が**展開後 2.57 GB**（圧縮 54 MB, 2449 ブロック）になった。
+1 ストリームを 1 つの配列に展開すると 2 GB を超えるので、実装はブロック単位で必要な範囲だけ展開する（`WpixStream.Read`）。
 
 ストリーム ID は固定ではなくレコード種別に依存して増える可能性がある。デコーダはストリーム ID に依存せず、**全ストリームのレコードを seq でソート**して扱う。
 
@@ -103,11 +106,14 @@ typeId = base[宣言インターフェース] + (そのインターフェース�
 |---|---|---|
 | ID3D12Object | 970 | SetName = 973 |
 | ID3D12GraphicsCommandList | 992 | Close=992, Reset=993, DrawInstanced=995, Dispatch=997, ResourceBarrier=1009, BeginEvent=1040 |
+| ID3D12GraphicsCommandList1 | 1620 | OMSetDepthBounds=1622（UE5 で観測） |
+| ID3D12GraphicsCommandList2 | 1698 | WriteBufferImmediate=1698（UE5 で観測） |
 | ID3D12CommandQueue | 1063 | ExecuteCommandLists=1065, Signal=1069, Wait=1070 |
 | ID3D12Device | 1074 | CreateCommandQueue=1075, CreateRootSignature=1083, CreateFence=1103 |
 | ID3D12Device2 | 1629 | CreatePipelineState=1629（PIX 独自形式。§3.6） |
 | ID3D12Device4 | 1711 | CreateCommandList1=1711 |
 | ID3D12GraphicsCommandList4 | 1919 | BuildRaytracingAccelerationStructure=1923, SetPipelineState1=1926, DispatchRays=1927 |
+| ID3D12GraphicsCommandList5 | 1952 | RSSetShadingRate=1952, RSSetShadingRateImage=1953（UE5 で観測） |
 | ID3D12GraphicsCommandList6 | 1999 | DispatchMesh=1999 |
 | ID3D12GraphicsCommandList7 | 2081 | Barrier=2081 |
 
@@ -116,6 +122,9 @@ typeId = base[宣言インターフェース] + (そのインターフェース�
 
 base の間隔はヘッダ上のインターフェース順と完全には一致しない（間に別インターフェースが入る）。
 新しい API を使ったキャプチャで未知 typeId が出たら、`this` の型とペイロード長の完全一致で base を特定して追記する。
+実アプリのキャプチャでは、pixtool のイベント一覧（`save-event-list`）の API 別件数と未知 typeId の件数を突き合わせると候補が絞れる
+（例: 未知 1698 が 2403 件 ↔ WriteBufferImmediate 2388 件 → 中身が `this, u32 Count, D3D12_WRITEBUFFERIMMEDIATE_PARAMETER[], MODE[]` で
+過不足なく読めることを確認）。
 
 ### 2.2 PIX 独自 typeId 🔶
 
@@ -131,6 +140,8 @@ base の間隔はヘッダ上のインターフェース順と完全には一致
 | 2042 | PIX::CaptureEnvironment | CPU 名, アーキ, 物理メモリ, OS, OS ビルド, **マシン名**, プロセス名, 時刻(FILETIME), PID, PIX バージョン |
 | 2043 | PIX::Unknown2043 | `u32`（0 を観測）❓ |
 | 2044 | PIX::DescriptorHeap | §4.3 |
+| 2033 | PIX::WriteDescriptors | フレーム中のディスクリプタヒープへの書き込み。§4.8 ✅ |
+| 2034 | PIX::UploadPages | CPU が書き込んだアップロードヒープのページ内容。§4.9 ✅ |
 | 1065 | ExecuteCommandLists | 汎用規則と異なる独自形式。§3.4 |
 | 1629 | ID3D12Device2::CreatePipelineState | Stream を固定構造に展開した独自形式。§3.6 |
 | 1767 | PIX::CreatePlacedResource | §4.4 |
@@ -234,12 +245,13 @@ D3D12 API レコードの body は **`u32 this` → (戻り値が HRESULT なら
 ### 3.3 ディスクリプタ（CBV_SRV_UAV） ✅
 
 ```
-u32 kind   0=Empty 1=CBV 2=SRV 3=UAV (4 以降 ❓)
+u32 kind   0=Empty 1=CBV 2=SRV 3=UAV 6=Sampler (4, 5 は未観測 ❓)
 kind=1: u8 present + D3D12_CONSTANT_BUFFER_VIEW_DESC         (BufferLocation は GPUVA 形式)
+kind=6: u8 present + D3D12_SAMPLER_DESC                      (Sampler ヒープ。UE5 で観測 ✅)
 kind=2: u8 present + D3D12_SHADER_RESOURCE_VIEW_DESC, u32 resource, u8 present + D3D12_RESOURCE_DESC
 kind=3: u8 present + D3D12_UNORDERED_ACCESS_VIEW_DESC, u32 resource, u32 counterResource, u8 present + D3D12_RESOURCE_DESC
 ```
-❓ counterResource ≠ 0 の場合、Sampler ヒープ、RTV/DSV がヒープスナップショットに出るケースは未検証。
+❓ counterResource ≠ 0 の場合、RTV/DSV がヒープスナップショットに出るケースは未検証。
 
 ### 3.4 ExecuteCommandLists（typeId 1065, 独自形式） ✅
 
@@ -337,7 +349,9 @@ u8 data[totalSize]                      ← GetCopyableFootprints のレイア�
 u32 ❓(=0), u32 device
 u8 present + D3D12_DESCRIPTOR_HEAP_DESC   (NodeMask は 1 を観測)
 u32 ❓(=0)
-u8 present + u64 count(=NumDescriptors) + ディスクリプタ[count]   ← 全スロット。空きは kind=0 (4 bytes)
+u8 present + u64 count + ディスクリプタ[count]   ← 先頭から count スロット。空きは kind=0 (4 bytes)
+                                                   自作サンプルでは count = NumDescriptors。UE5 の 100 万スロットのヒープでは
+                                                   count = 1 で、中身は 2033 (§4.8) で届く
 u32 numDescriptorEntries (= NumDescriptors) ✅
 GUID riid (ID3D12DescriptorHeap)
 u8 present + u32 heapId
@@ -385,12 +399,57 @@ u8[16] ❓, u64 n,
 
 ---
 
+### 4.8 PIX::WriteDescriptors (2033) ✅
+
+フレーム中にシェーダ可視ヒープへ書き込まれたディスクリプタ（UE5 の GlobalResourceHeap / Sampler ヒープで 14,183 件）。
+
+```
+u32 ❓(=0), u32 heap, u32 index, u32 count
+u8 present + u64 n + ディスクリプタ[n] (§3.3)      → heap[index .. index+n) の新しい内容
+```
+
+GPU は実行時にディスクリプタを読むので、**コマンドリストが見る内容 = 2044 + そのリストの ExecuteCommandLists より前の 2033**
+として `draws` を解決する 🔶。UE5 のキャプチャで、シェーダが使うスロット（§4.10）20,274 個が全て解決し、
+レジスタ種別（t/u/s）とディスクリプタ種別が全て一致した。ただし「SetXRootDescriptorTable より前」「Draw より前」の 2033 を
+適用するモデルでも使用スロットの結果は 1 件も変わらないため、タイミングの正しさまでは区別できていない
+（違いが出るのは未使用スロットだけ）。
+自作サンプル（ヒープ 8 スロット）のフレーム内 CreateSRV / CopyDescriptorsSimple では 2033 は出ず、2044 に反映された（§4.3）。
+どの条件で 2033 になるか（ヒープの大きさ・書き込み時期）は ❓。
+
+### 4.9 PIX::UploadPages (2034) ✅
+
+CPU が書き込んだ（Map された）アップロードヒープの内容。**コマンドリストの Reset の直前**に記録される（UE5 で 78 件全て, 最大 61 MB）。
+
+```
+u32 ❓(=0)
+u64 M, M × { u64 resource, u64 N, N × { u64 page, u64 size(=0x1000), u8[size], u64 size }, u64 N }
+u32 M
+```
+
+`resource=0, N=0` の空エントリが混じる。`page × size` がリソース先頭からのオフセット。resource は全て
+`D3D12_HEAP_TYPE_UPLOAD` のバッファ（4 MB / 8 MB の UE のアロケータページ）で、中身は BC 圧縮テクスチャ・頂点データ等 ✅。
+4 KB ページ単位なので、PIX は書き込み監視（write watch）で変更ページだけを記録していると推定 🔶。
+
+### 4.10 シェーダが使うバインディング（draws の `used`） ✅
+
+UE5 などはディスクリプタテーブルを大きめに宣言し（SRV 64 個等）、未使用スロットには他の割り当ての残骸が入る
+（`DESCRIPTORS_VOLATILE` なので D3D12 として正当）。PSO の各ステージのシェーダから実際に使うレジスタを読み、
+ルートパラメータの `ShaderVisibility` に対応するステージ分だけで判定する（PIXEL 可視のテーブルは PS だけ）。
+
+- DXIL: `PSV0` パート（UE5 の 338 シェーダ全てで `dxc -dumpbin` の Resource Bindings と一致 ✅）: `u32 runtimeInfoSize, PSVRuntimeInfo, u32 resourceCount, u32 bindInfoSize, {u32 ResType, Space, LowerBound, UpperBound, ...}[]`
+- DXBC: `RDEF` チャンクのバインド記述（5.1 以降 40 B: 末尾に space, id。5.1 は `fxc /dumpbin` と一致 ✅、5.0 の 32 B は未検証）
+- compute パイプラインは ShaderVisibility に関係なく CS で判定する
+- 判定できない場合（DispatchRays のライブラリ等）は `used = null` で全スロットを表示する
+
 ## 5. 未解明・今後の課題
 
 - ファイルヘッダ/セクショントレーラの各フィールド、`META` の 20 bytes、EVT ヘッダ reserved
 - D3D12CreateDevice (1566) 後半の caps 構造、2043
 - 2037（タイルマッピング）・2038（シェーダテーブル）の詳細構造、2041 の ❓ 部分、2139 の 16 B ヘッダ、2030/2039/1629/2045 の ❓ 領域
 - BLAS をフレーム内でビルドするケース（`pGeometryDescs` のシリアライズ）、EmitPostbuildInfo / CopyRaytracingAccelerationStructure
-- 未検証の引数種別: ExecuteIndirect の VB/IB/CBV/SRV/UAV/DISPATCH_RAYS 引数、SUBOBJECT_TO_EXPORTS_ASSOCIATION、Sampler ヒープのスナップショット
+- 未検証の引数種別: ExecuteIndirect の VB/IB/CBV/SRV/UAV/DISPATCH_RAYS 引数、SUBOBJECT_TO_EXPORTS_ASSOCIATION
+- 2033 と 2044 の使い分け条件、ディスクリプタ kind 4/5、2034 の先頭 u32
+- pixtool のイベント一覧は、UE5 キャプチャのコマンドリストを 158 本しか表示しない（ファイルには Reset/Close 付きで 172 本。
+  差の 14 本はタイムスタンプ用の小さなリスト #4 の記録と見られるが、どれが除外されたかは未特定）。理由は ❓
 - WorkGraphs（DispatchGraph / SetProgram）、`WINPIX_EVENT_PIX3BLOB_V2` マーカー
 - PIX のバージョン差（ファイルヘッダ値との対応）

@@ -139,6 +139,12 @@ def cmd_objects(a) -> None:
         print(f"#{oid:<4d} {o.get('interface', '?'):28s} {o.get('name') or '':32s}{extra}")
 
 
+def safe_name(s: str, limit: int = 80) -> str:
+    """オブジェクト名をファイル名に使える形にする (UE5 などはパス付きの名前 "/Engine/..." 等を付ける)。"""
+    out = "".join("_" if c in r'\/:*?"<>| ' or ord(c) < 32 else c for c in s)
+    return out[:limit]
+
+
 def cmd_extract(a) -> None:
     from .pngwrite import write_png_rgba
     from .wpix.capture import Capture
@@ -153,7 +159,7 @@ def cmd_extract(a) -> None:
         p.write_bytes(b["data"])
         manifest["blobs"].append({"file": p.name, "kind": b["kind"], "size": b["size"]})
     for rid, d in cap.resource_initial_data():
-        name = (cap.objects.get(rid, {}).get("name") or f"res{rid}").replace(" ", "_")
+        name = safe_name(cap.objects.get(rid, {}).get("name") or f"res{rid}")
         p = out / "resources" / f"{rid:04d}_{name}.bin"
         p.write_bytes(d["data"])
         entry = {"resource": rid, "name": name, "file": f"resources/{p.name}", "footprints": d["footprints"]}
@@ -178,7 +184,7 @@ def cmd_extract(a) -> None:
             for stage in ("VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS"):
                 sb = desc.get(stage)
                 if isinstance(sb, dict) and isinstance(sb.get("pShaderBytecode"), (bytes, bytearray)):
-                    nm = cap.objects.get(pso, {}).get("name") or f"pso{pso}"
+                    nm = safe_name(cap.objects.get(pso, {}).get("name") or f"pso{pso}")
                     blob = bytes(sb["pShaderBytecode"])
                     ext = "dxil" if b"DXIL" in blob[:4096] else "dxbc"
                     p = out / "shaders" / f"{pso:04d}_{nm}_{stage}.{ext}"
@@ -188,7 +194,7 @@ def cmd_extract(a) -> None:
             # DXR などの StateObject: DXIL ライブラリを書き出す
             raw = cap.raw_args(c)
             so = raw.get("ppStateObject") or 0
-            nm = cap.objects.get(so, {}).get("name") or f"so{so}"
+            nm = safe_name(cap.objects.get(so, {}).get("name") or f"so{so}")
             li = 0
             for sub in (raw.get("pDesc") or {}).get("pSubobjects") or []:
                 lib = ((sub.get("desc") or {}).get("DXILLibrary") or {}).get("pShaderBytecode")
@@ -203,7 +209,7 @@ def cmd_extract(a) -> None:
             rs = (raw.get("ppvRootSignature") or {}).get("obj")
             blob = raw.get("pBlobWithRootSignature")
             if isinstance(blob, (bytes, bytearray)):
-                nm = cap.objects.get(rs, {}).get("name") or f"rs{rs}"
+                nm = safe_name(cap.objects.get(rs, {}).get("name") or f"rs{rs}")
                 p = out / "shaders" / f"{rs:04d}_{nm}.rootsig"
                 p.write_bytes(bytes(blob))
                 manifest["shaders"].append({"rootSignature": rs, "file": f"shaders/{p.name}"})
@@ -234,7 +240,11 @@ def cmd_draws(a) -> None:
             if b["type"] == "table":
                 print(head)
                 for x in b["descriptors"]:
-                    print(f"        {x['register'] or '?':5s} heap[{x['heapSlot']}] {x['kind']:5s} {x['resource'] or ''}")
+                    if x.get("used") is not False:   # シェーダが使わないスロットは省略 (判定不能なら表示)
+                        print(f"        {x['register'] or '?':5s} heap[{x['heapSlot']}] {x['kind']:5s} {x['resource'] or ''}")
+                unused = sum(1 for x in b["descriptors"] if x.get("used") is False)
+                if unused:
+                    print(f"        (+{unused} slots not used by the shaders)")
             elif b["type"] == "constants":
                 print(f"{head} {b['register']} = {b['values']}")
             else:

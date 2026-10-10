@@ -12,12 +12,16 @@ PIX などの GUI/CLI では取り出しにくい情報を自動解析できる�
 ExecuteIndirect、RenderPass、Bundle、PipelineStateStream、Mesh/Amplification シェーダ、Enhanced Barriers、
 DXR（StateObject・加速構造・DispatchRays）、Copy/Compute キュー + Fence 同期、PIX3 形式マーカー、複数フレームキャプチャ。
 
+**実アプリでも検証済み**: UE5 のパッケージ済みゲーム（`-dx12`, 1 フレーム, 49,181 レコード, 展開後 2.7 GB）を全レコード
+デコードでき、C# 版と Python 版の出力が一致。PIX のイベント一覧と API 別件数が一致（ExecuteIndirect の展開分を除く）。
+
 
 - `.wpix` コンテナの完全パース（XPRESS 圧縮ブロックの展開、ストリーム/ディレクトリ構造）
 - 記録された **全 API 呼び出しのデコード**（d3d12.h から自動生成した型情報 + 解析で判明したシリアライズ規則）
   - 引数・構造体・enum 名・オブジェクト名（SetName）・GPU VA（リソース+オフセット）・ディスクリプタの中身
 - キュー・コマンドリスト単位のコマンド列再構成（PIX マーカーの階層付き、Bundle の展開）
 - **Draw/Dispatch 毎のバインディング解決**（ルートシグネチャ blob を解析し、ディスクリプタテーブル → 実リソース、VB/IB、RTV/DSV を特定）
+  - フレーム中のディスクリプタ書き込みを実行順に反映し、シェーダ（DXIL の PSV0 / DXBC の RDEF）が実際に使うスロットだけを表示
 - キャプチャ開始時点のリソース内容・ステート・ディスクリプタヒープのスナップショット
 - リソース初期データ / シェーダバイトコード / ルートシグネチャ / スクリーンショットの抽出
 - **シェーダシンボル（PDB）の探索と照合**: キャプチャと同じフォルダ / 指定フォルダ / シンボルサーバを再帰探索し、
@@ -64,6 +68,8 @@ tests/test_wpix.py           Python 版: manifest 照合 + export-to-cpp 照合
 tests/test_csharp_parity.py  C# 版 == Python 版 (calls / draws / extract の出力一致)
 tests/test_wpix_ext.py       Python 版: 拡張 API (DXR/Mesh/EB/RenderPass/Bundle/ExecuteIndirect/...) と複数フレーム
 tests/test_shader_symbols.py シェーダ PDB 探索 (キャプチャフォルダ/指定フォルダ/ストア/HTTP/打ち切り/古い PDB の除外/IL)
+tests/test_real_world.py     実アプリのキャプチャ (captures/real/*.wpix) の全デコード・C#/Python 一致・バインディング整合性
+scripts/capture_app.py       任意の D3D12 アプリを pixtool で起動して 1 フレームキャプチャ (+ イベント一覧)
 scripts/gen_tool_output_doc.py docs/tool-output.md (出力例) の再生成
 docs/                        フォーマット仕様・手法
 captures/                    キャプチャ置き場 (git 管理外)
@@ -78,6 +84,8 @@ cmake --build samples/DX12CaptureTarget/build --config Release
 
 # テスト用キャプチャ一式 (base / dxil / ext / multi) + pixtool による正解データ生成
 python scripts/capture_pix.py --preset all
+# 実アプリ (例: UE5 のゲームを DX12 で) → captures/real/<name>.wpix
+python scripts/capture_app.py path/to/Game.exe --args "-dx12"
 
 # 解析作業用 (Python)
 cd tools

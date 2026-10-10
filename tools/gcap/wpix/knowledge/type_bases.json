@@ -3,11 +3,14 @@
   "bases": {
     "ID3D12Object": 970,
     "ID3D12GraphicsCommandList": 992,
+    "ID3D12GraphicsCommandList1": 1620,
+    "ID3D12GraphicsCommandList2": 1698,
     "ID3D12CommandQueue": 1063,
     "ID3D12Device": 1074,
     "ID3D12Device2": 1629,
     "ID3D12Device4": 1711,
     "ID3D12GraphicsCommandList4": 1919,
+    "ID3D12GraphicsCommandList5": 1952,
     "ID3D12GraphicsCommandList6": 1999,
     "ID3D12GraphicsCommandList7": 2081
   },

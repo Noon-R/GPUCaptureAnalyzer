@@ -96,8 +96,8 @@ public static class Program
     // ---------------------------------------------------------------------------------------------
     private static void Info(string file, ApiDecoder dec)
     {
-        var w = new WpixFile(file);
-        Console.WriteLine($"file: {file}  size=0x{w.Buf.Length:x}");
+        using var w = new WpixFile(file);
+        Console.WriteLine($"file: {file}  size=0x{w.Length:x}");
         Console.WriteLine($"header: u32@0x0c={w.HeaderU32_0x0C} u32@0x10={w.HeaderU32_0x10} u32@0x40={w.HeaderU32_0x40}");
         foreach (var s in w.Sections)
         {
@@ -105,12 +105,12 @@ public static class Program
             Console.WriteLine($"  {"stream",6} {"blocks",6} {"comp",10} {"raw",10} {"recs",5}  types");
             foreach (var st in s.Streams)
             {
-                var recs = EvtRecord.Iterate(st.Id, st.Data).ToList();
+                var recs = EvtRecord.Iterate(st).ToList();
                 var comp = st.Blocks.Aggregate(0UL, (acc, b) => acc + b.CompSize);
                 var types = recs.Select(r => r.Type).Distinct().Order().ToList();
                 var tn = string.Join(", ", types.Take(6).Select(t => $"{t}:{dec.ApiName(t).Split("::")[^1]}"));
                 if (types.Count > 6) tn += $", ... ({types.Count} types)";
-                Console.WriteLine($"  {st.Id,6} {st.Blocks.Count,6} {comp,10} {st.Data.Length,10} {recs.Count,5}  {tn}");
+                Console.WriteLine($"  {st.Id,6} {st.Blocks.Count,6} {comp,10} {st.Length,10} {recs.Count,5}  {tn}");
             }
         }
     }
@@ -122,6 +122,7 @@ public static class Program
         {
             case null: return "null";
             case byte[] b: return $"<{b.Length} bytes>";
+            case LazyBytes lb: return $"<{lb.Length} bytes>";
             case Obj o:
                 if (o.Count == 1 && o.ContainsKey("obj")) return cap.ObjectName(o.GetLong("obj"));
                 if (o.Count == 2 && o.ContainsKey("resource") && o.ContainsKey("offset"))
@@ -234,8 +235,12 @@ public static class Program
                 {
                     case "table":
                         Console.WriteLine(head);
-                        foreach (var x in b.GetList("descriptors")!.OfType<Obj>())
+                        var descs = b.GetList("descriptors")!.OfType<Obj>().ToList();
+                        // シェーダが使わないスロットは省略 (判定不能なら表示)
+                        foreach (var x in descs.Where(x => x.Get("used") is not false))
                             Console.WriteLine($"        {x.GetStr("register") ?? "?",-5} heap[{x.Get("heapSlot")}] {x.Get("kind"),-5} {x.Get("resource")}");
+                        int unused = descs.Count(x => x.Get("used") is false);
+                        if (unused > 0) Console.WriteLine($"        (+{unused} slots not used by the shaders)");
                         break;
                     case "constants": Console.WriteLine($"{head} {b.Get("register")} = {b.Get("values")}"); break;
                     default:
@@ -257,6 +262,14 @@ public static class Program
 
     private static readonly string[] Rgba8Formats = ["DXGI_FORMAT_R8G8B8A8_UNORM", "DXGI_FORMAT_R8G8B8A8_UNORM_SRGB", "DXGI_FORMAT_B8G8R8A8_UNORM"];
 
+    /// <summary>オブジェクト名をファイル名に使える形にする (UE5 などはパス付きの名前を付ける)。tools/gcap と同じ規則。</summary>
+    private static string SafeName(string s, int limit = 80)
+    {
+        var sb = new System.Text.StringBuilder(s.Length);
+        foreach (var ch in s) sb.Append(@"\/:*?""<>| ".Contains(ch) || ch < 32 ? '_' : ch);
+        return sb.Length > limit ? sb.ToString(0, limit) : sb.ToString();
+    }
+
     private static void Extract(Capture cap, string outDir)
     {
         Directory.CreateDirectory(Path.Combine(outDir, "resources"));
@@ -269,14 +282,14 @@ public static class Program
         {
             var kind = b.GetStr("kind")!;
             var name = $"blob_{bi++}_{kind[..8]}.{(b.Get("isScreenshotPng") is true ? "png" : "bin")}";
-            File.WriteAllBytes(Path.Combine(outDir, name), (byte[])b["data"]!);
+            File.WriteAllBytes(Path.Combine(outDir, name), V.Bytes(b["data"])!);
             blobs.Add(new Obj { ["file"] = name, ["kind"] = kind, ["size"] = b.Get("size") });
         }
         foreach (var (rid, d) in cap.ResourceInitialData())
         {
-            var nm = (cap.Objects.GetValueOrDefault(rid)?.GetStr("name") ?? $"res{rid}").Replace(' ', '_');
+            var nm = SafeName(cap.Objects.GetValueOrDefault(rid)?.GetStr("name") ?? $"res{rid}");
             var fname = $"{rid:D4}_{nm}.bin";
-            var data = (byte[])d["data"]!;
+            var data = V.Bytes(d["data"])!;
             File.WriteAllBytes(Path.Combine(outDir, "resources", fname), data);
             var entry = new Obj { ["resource"] = rid, ["name"] = nm, ["file"] = $"resources/{fname}", ["footprints"] = d.Get("footprints") };
             // RGBA8 / BGRA8 テクスチャは mip0 を PNG 化
@@ -308,7 +321,7 @@ public static class Program
                 foreach (var stage in new[] { "VS", "PS", "DS", "HS", "GS", "CS", "AS", "MS" })
                 {
                     if (desc?.GetObj(stage)?.Get("pShaderBytecode") is not byte[] blob) continue;
-                    var nm = cap.Objects.GetValueOrDefault(pso)?.GetStr("name") ?? $"pso{pso}";
+                    var nm = SafeName(cap.Objects.GetValueOrDefault(pso)?.GetStr("name") ?? $"pso{pso}");
                     var ext = IndexOf(blob.AsSpan(0, Math.Min(4096, blob.Length)), "DXIL"u8) >= 0 ? "dxil" : "dxbc";
                     var fname = $"{pso:D4}_{nm}_{stage}.{ext}";
                     File.WriteAllBytes(Path.Combine(outDir, "shaders", fname), blob);
@@ -319,7 +332,7 @@ public static class Program
             {
                 // DXR などの StateObject: DXIL ライブラリを書き出す
                 var so = c.Args.GetLong("ppStateObject") ?? 0;
-                var nm = cap.Objects.GetValueOrDefault(so)?.GetStr("name") ?? $"so{so}";
+                var nm = SafeName(cap.Objects.GetValueOrDefault(so)?.GetStr("name") ?? $"so{so}");
                 int li = 0;
                 foreach (var sub in (c.Args.GetObj("pDesc")?.GetList("pSubobjects") ?? []).OfType<Obj>())
                 {
@@ -332,7 +345,7 @@ public static class Program
             if (c.Api.EndsWith("::CreateRootSignature") && c.Args.Get("pBlobWithRootSignature") is byte[] rsb)
             {
                 var rs = c.Args.ObjId("ppvRootSignature") ?? 0;
-                var nm = cap.Objects.GetValueOrDefault(rs)?.GetStr("name") ?? $"rs{rs}";
+                var nm = SafeName(cap.Objects.GetValueOrDefault(rs)?.GetStr("name") ?? $"rs{rs}");
                 var fname = $"{rs:D4}_{nm}.rootsig";
                 File.WriteAllBytes(Path.Combine(outDir, "shaders", fname), rsb);
                 shaders.Add(new Obj { ["rootSignature"] = rs, ["file"] = $"shaders/{fname}" });

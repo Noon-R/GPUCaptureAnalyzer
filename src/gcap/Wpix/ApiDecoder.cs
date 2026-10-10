@@ -139,7 +139,7 @@ public sealed partial class ApiDecoder
     // CBV_SRV_UAV ヒープ上のディスクリプタ種別 (PIX 独自の列挙)
     private static readonly Dictionary<long, string> DescriptorKind = new()
     {
-        [0] = "Empty", [1] = "CBV", [2] = "SRV", [3] = "UAV", [4] = "Sampler?", [5] = "RTV?", [6] = "DSV?",
+        [0] = "Empty", [1] = "CBV", [2] = "SRV", [3] = "UAV", [6] = "Sampler",   // 4, 5 は未観測
     };
 
     // SAL 上は単一ポインタだが PIX は配列として記録する引数
@@ -293,7 +293,7 @@ public sealed partial class ApiDecoder
         throw new DecodeException($"cpu descriptor handle in unknown context ({kind})");
     }
 
-    /// <summary>CBV_SRV_UAV ヒープのディスクリプタ: u32 種別 + 内容 (wpix.md §3.3)。</summary>
+    /// <summary>シェーダ可視ヒープのディスクリプタ: u32 種別 + 内容 (wpix.md §3.3)。2044 / 2033 で共通。</summary>
     public Obj ReadDescriptor(ByteReader r)
     {
         long k = r.U32();
@@ -303,6 +303,9 @@ public sealed partial class ApiDecoder
             case 0: return o;
             case 1:
                 o["view"] = r.Flag() ? ReadType(r, "D3D12_CONSTANT_BUFFER_VIEW_DESC") : null;
+                return o;
+            case 6: // Sampler ヒープ (UE5 キャプチャで観測)
+                o["view"] = r.Flag() ? ReadType(r, "D3D12_SAMPLER_DESC") : null;
                 return o;
             case 2:
                 o["view"] = r.Flag() ? ReadType(r, "D3D12_SHADER_RESOURCE_VIEW_DESC") : null;
@@ -484,16 +487,34 @@ public sealed partial class ApiDecoder
     // ---------------------------------------------------------------------------------------------
     // レコード
     // ---------------------------------------------------------------------------------------------
+    /// <summary>デコード中のレコード (TakeBlob が元データの位置を覚えるため)。</summary>
+    private EvtRecord? _current;
+
+    /// <summary>この大きさ以上のデータはデコード結果に実体を持たせない (LazyBytes)。</summary>
+    public const int LazyThreshold = 64 * 1024;
+
+    /// <summary>r から n バイト取る。大きいものは読み飛ばして LazyBytes (ストリームから読み直す) にする。</summary>
+    public object TakeBlob(ByteReader r, ulong n)
+    {
+        if (n < LazyThreshold || _current is null) return r.Take(n);
+        var rec = _current;
+        long off = rec.BodyOffset + r.Pos, len = (long)n;
+        var head = r.Take(64);
+        r.Skip((long)n - 64);
+        var src = rec.Source;
+        return new LazyBytes(len, head, () => src.Read(off, len));
+    }
+
     public Call Decode(EvtRecord rec)
     {
+        _current = rec;
         var payload = rec.Payload;
         var api = ApiName(rec.Type);
         if (payload.Length < EvtRecord.MetaSize || System.Text.Encoding.Latin1.GetString(payload, 0, 4) != "META")
             return new Call { Seq = rec.Seq, Stream = rec.StreamId, Type = rec.Type, Api = api, Ok = false,
                               Error = "payload does not start with META", Raw = payload };
-        var body = payload[EvtRecord.MetaSize..];
-        var call = new Call { Seq = rec.Seq, Stream = rec.StreamId, Type = rec.Type, Api = api, Raw = body };
-        var r = new ByteReader(body);
+        var call = new Call { Seq = rec.Seq, Stream = rec.StreamId, Type = rec.Type, Api = api };
+        var r = new ByteReader(payload, EvtRecord.MetaSize);   // body (META の後)
         try
         {
             if (Custom.TryGetValue(rec.Type, out var cd)) call.Args = cd.fn(r, this);
@@ -517,6 +538,8 @@ public sealed partial class ApiDecoder
             call.Ok = false;
             call.Error = $"{e.GetType().Name}: {e.Message} (at {r.Pos})";
         }
+        if (!call.Ok) call.Raw = payload[EvtRecord.MetaSize..];   // 解析用 (成功したレコードは保持しない: メモリ節約)
+        _current = null;
         return call;
     }
 

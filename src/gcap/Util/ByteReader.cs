@@ -33,6 +33,12 @@ public sealed class ByteReader
 
     public byte[] Take(ulong n) => Take(n > int.MaxValue ? -1L : (long)n);
 
+    public void Skip(long n)
+    {
+        Need(n);
+        _pos += (int)n;
+    }
+
     public byte[] Take(long n)
     {
         Need(n);

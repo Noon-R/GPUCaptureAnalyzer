@@ -442,6 +442,42 @@ def _descriptor_heap(r: Reader, d: "ApiDecoder") -> dict:
     return out
 
 
+def _write_descriptors(r: Reader, d: "ApiDecoder") -> dict:
+    # 2033: フレーム中のディスクリプタヒープへの書き込み (heap[index .. index+count) の新しい内容)。
+    # UE5 の GlobalResourceHeap / Sampler ヒープで観測。自作サンプルの CreateSRV/CopyDescriptors では出なかった
+    out: dict[str, Any] = {"unk0": r.u32(), "heap": r.u32(), "index": r.u32(), "count": r.u32()}
+    descs = None
+    if r.flag():
+        descs = [d.read_descriptor(r) for _ in range(r.u64())]
+    out["descriptors"] = descs
+    return out
+
+
+def _upload_pages(r: Reader, d: "ApiDecoder") -> dict:
+    # 2034: CPU が書き込んだ (Map された) アップロードヒープのページ内容。コマンドリストの Reset の直前に記録される。
+    #   u32 0, u64 M, M x {u64 resource, u64 N, N x {u64 page, u64 size(0x1000), u8[size], u64 size}, u64 N}, u32 M
+    #   resource=0, N=0 の空エントリが混じる。page * size がリソース先頭からのオフセット (UE5 キャプチャで観測)
+    out: dict[str, Any] = {"unk0": r.u32()}
+    entries = []
+    for _ in range(r.u64()):
+        e: dict[str, Any] = {"resource": r.u64()}
+        pages = []
+        for _ in range(r.u64()):
+            page, size = r.u64(), r.u64()
+            data = r.take(size)
+            if r.u64() != size:
+                raise DecodeError("2034: page size mismatch")
+            pages.append({"page": page, "offset": page * size, "data": data})
+        if r.u64() != len(pages):
+            raise DecodeError("2034: page count mismatch")
+        e["pages"] = pages
+        entries.append(e)
+    out["entries"] = entries
+    if r.u32() != len(entries):
+        raise DecodeError("2034: entry count mismatch")
+    return out
+
+
 def _u32_only(r: Reader, d: "ApiDecoder") -> dict:
     return {"value": r.u32()}
 
@@ -459,6 +495,8 @@ CUSTOM_EVENTS = [
     (2042, "PIX::CaptureEnvironment", _capture_environment),
     (2043, "PIX::Unknown2043", _u32_only),
     (2044, "PIX::DescriptorHeap", _descriptor_heap),
+    (2033, "PIX::WriteDescriptors", _write_descriptors),
+    (2034, "PIX::UploadPages", _upload_pages),
     (1629, "ID3D12Device2::CreatePipelineState", _create_pipeline_state),
     (1767, "PIX::CreatePlacedResource", _create_placed_resource),
     (1770, "PIX::CreateReservedResource", _create_reserved_resource),

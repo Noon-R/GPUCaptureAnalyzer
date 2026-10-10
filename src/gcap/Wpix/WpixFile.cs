@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using Gcap.Util;
+using Microsoft.Win32.SafeHandles;
 
 namespace Gcap.Wpix;
 
@@ -12,6 +13,9 @@ namespace Gcap.Wpix;
 //   end-0x400   ファイルトレーラ (0x400, 末尾 "GFXBGFXA")
 //   セクション内: ブロック列 / DIR3 テーブル + フッタ(DIR2) / トレーラ 0x40 (末尾 "CAP>")
 //   BLOKCOMP: "BLOKCOMP" u64 size "CBLKDATA" u64 rawSize + XPRESS(RAW) / BLOKDATA: "BLOKDATA" u64 size + raw
+//
+// 実ゲームのキャプチャではストリーム (リソース初期データ等) が展開後 2GB を超えるため、
+// ファイルもストリームも丸ごとメモリに置かず、ブロック単位で必要な範囲だけ展開する。
 
 public sealed class WpixFormatException(string message) : Exception(message);
 
@@ -23,8 +27,50 @@ public sealed class WpixStream
 {
     public required uint Id { get; init; }
     public required DirEntry Entry { get; init; }
+    public required WpixFile File { get; init; }
     public List<Block> Blocks { get; } = [];
-    public byte[] Data { get; set; } = [];
+    private long[] _starts = [];          // 各ブロックの展開後の開始オフセット
+    private int _cacheIdx = -1;           // 直近に展開したブロック (レコードは順に読まれるので 1 個で十分)
+    private byte[] _cache = [];
+
+    /// <summary>展開後のバイト数。</summary>
+    public long Length { get; private set; }
+
+    internal void Seal()
+    {
+        _starts = new long[Blocks.Count];
+        long acc = 0;
+        for (int i = 0; i < Blocks.Count; i++) { _starts[i] = acc; acc += (long)Blocks[i].RawSize; }
+        Length = acc;
+    }
+
+    /// <summary>展開後のストリーム中の [offset, offset+length) を返す (ブロックをまたいでよい)。</summary>
+    public byte[] Read(long offset, long length)
+    {
+        if (offset < 0 || length < 0 || offset + length > Length)
+            throw new WpixFormatException($"stream {Id}: read 0x{offset:x}+0x{length:x} past end 0x{Length:x}");
+        if (length > Array.MaxLength) throw new WpixFormatException($"stream {Id}: record too large (0x{length:x})");
+        var dst = new byte[length];
+        long done = 0;
+        int bi = Array.BinarySearch(_starts, offset);
+        if (bi < 0) bi = ~bi - 1;
+        while (done < length)
+        {
+            var blk = BlockData(bi);
+            long inBlk = offset + done - _starts[bi];
+            long n = Math.Min(blk.Length - inBlk, length - done);
+            Buffer.BlockCopy(blk, (int)inBlk, dst, (int)done, (int)n);
+            done += n;
+            bi++;
+        }
+        return dst;
+    }
+
+    private byte[] BlockData(int i)
+    {
+        if (i != _cacheIdx) { _cache = File.DecompressBlock(Blocks[i]); _cacheIdx = i; }
+        return _cache;
+    }
 }
 
 public sealed class Section
@@ -35,37 +81,53 @@ public sealed class Section
     public List<WpixStream> Streams { get; } = [];
 }
 
-public sealed class WpixFile
+public sealed class WpixFile : IDisposable
 {
     public string Path { get; }
-    public byte[] Buf { get; }
+    public long Length { get; }
     public uint HeaderU32_0x0C { get; }
     public uint HeaderU32_0x10 { get; }
     public (uint, uint) HeaderU32_0x40 { get; }
     public List<DirEntry> TopEntries { get; }
     public List<Section> Sections { get; } = [];
+    private readonly SafeFileHandle _h;
 
     public IEnumerable<WpixStream> Streams => Sections.SelectMany(s => s.Streams);
 
     public WpixFile(string path)
     {
         Path = path;
-        Buf = File.ReadAllBytes(path);
-        var b = Buf;
-        if (b.Length < 0x800 || Tag(0) != "GFXA" || Tag(8) != "GFXB")
+        _h = System.IO.File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        Length = RandomAccess.GetLength(_h);
+        if (Length < 0x800 || Tag(0) != "GFXA" || Tag(8) != "GFXB")
             throw new WpixFormatException("not a wpix file (missing GFXA/GFXB header)");
-        if (Encoding.Latin1.GetString(b, b.Length - 8, 8) != "GFXBGFXA")
+        if (Tag(Length - 8, 8) != "GFXBGFXA")
             throw new WpixFormatException("missing GFXBGFXA trailer");
         HeaderU32_0x0C = U32(0x0C);
         HeaderU32_0x10 = U32(0x10);
         HeaderU32_0x40 = (U32(0x40), U32(0x44));
-        TopEntries = ReadDirTable(b.Length - 0x400, "DIR0");
+        TopEntries = ReadDirTable(Length - 0x400, "DIR0");
         foreach (var e in TopEntries) Sections.Add(ParseSection(e));
     }
 
-    private string Tag(long off, int len = 4) => Encoding.Latin1.GetString(Buf, (int)off, len);
-    private uint U32(long off) => BinaryPrimitives.ReadUInt32LittleEndian(Buf.AsSpan((int)off));
-    private ulong U64(long off) => BinaryPrimitives.ReadUInt64LittleEndian(Buf.AsSpan((int)off));
+    public void Dispose() => _h.Dispose();
+
+    private byte[] ReadAt(long off, int len)
+    {
+        var b = new byte[len];
+        int got = 0;
+        while (got < len)
+        {
+            int n = RandomAccess.Read(_h, b.AsSpan(got), off + got);
+            if (n <= 0) throw new WpixFormatException($"unexpected end of file at 0x{off + got:x}");
+            got += n;
+        }
+        return b;
+    }
+
+    private string Tag(long off, int len = 4) => Encoding.Latin1.GetString(ReadAt(off, len));
+    private uint U32(long off) => BinaryPrimitives.ReadUInt32LittleEndian(ReadAt(off, 4));
+    private ulong U64(long off) => BinaryPrimitives.ReadUInt64LittleEndian(ReadAt(off, 8));
 
     /// <summary>footerEnd (フッタ直後) から逆に読む。フッタ 32B: u8[16], u64 tableBytes, u32 count, tag</summary>
     private List<DirEntry> ReadDirTable(long footerEnd, string expectTag)
@@ -76,11 +138,14 @@ public sealed class WpixFile
         uint count = U32(footerEnd - 8);
         if (tableBytes != count * 32UL) throw new WpixFormatException($"table size mismatch 0x{tableBytes:x} != {count}*32");
         long start = footerEnd - 32 - (long)tableBytes;
+        var t = ReadAt(start, (int)tableBytes);
         var list = new List<DirEntry>();
         for (int i = 0; i < count; i++)
         {
-            long o = start + i * 32;
-            list.Add(new DirEntry(Tag(o), U32(o + 4), U64(o + 8), U64(o + 16), U64(o + 24)));
+            var s = t.AsSpan(i * 32);
+            list.Add(new DirEntry(Encoding.Latin1.GetString(s[..4]), BinaryPrimitives.ReadUInt32LittleEndian(s[4..]),
+                                  BinaryPrimitives.ReadUInt64LittleEndian(s[8..]), BinaryPrimitives.ReadUInt64LittleEndian(s[16..]),
+                                  BinaryPrimitives.ReadUInt64LittleEndian(s[24..])));
         }
         return list;
     }
@@ -98,15 +163,10 @@ public sealed class WpixFile
         foreach (var de in ReadDirTable(end - 0x40, "DIR2"))
         {
             var st = sec.Streams.FirstOrDefault(x => x.Id == de.Id);
-            if (st is null) sec.Streams.Add(st = new WpixStream { Id = de.Id, Entry = de });
+            if (st is null) sec.Streams.Add(st = new WpixStream { Id = de.Id, Entry = de, File = this });
             ParseBlocks(st, (long)de.Offset, (long)(de.Offset + de.Size));
         }
-        foreach (var st in sec.Streams)
-        {
-            using var ms = new MemoryStream();
-            foreach (var blk in st.Blocks) ms.Write(DecompressBlock(blk));
-            st.Data = ms.ToArray();
-        }
+        foreach (var st in sec.Streams) st.Seal();
         return sec;
     }
 
@@ -115,10 +175,12 @@ public sealed class WpixFile
         long pos = start;
         while (pos < end)
         {
-            var magic = Tag(pos, 8);
-            ulong size = U64(pos + 8);
+            var h = ReadAt(pos, 32);
+            var magic = Encoding.Latin1.GetString(h, 0, 8);
+            ulong size = BinaryPrimitives.ReadUInt64LittleEndian(h.AsSpan(8));
             if (magic == "BLOKCOMP")
-                st.Blocks.Add(new Block(pos, size, U64(pos + 24), Tag(pos + 16, 8), pos + 32, (long)size - 16));
+                st.Blocks.Add(new Block(pos, size, BinaryPrimitives.ReadUInt64LittleEndian(h.AsSpan(24)),
+                                        Encoding.Latin1.GetString(h, 16, 8), pos + 32, (long)size - 16));
             else if (magic == "BLOKDATA") // 非圧縮 (PNG スクリーンショット等)
                 st.Blocks.Add(new Block(pos, size, size, "RAW", pos + 16, (long)size));
             else
@@ -128,39 +190,45 @@ public sealed class WpixFile
         if (pos != end) throw new WpixFormatException($"block chain overran stream end (0x{pos:x} != 0x{end:x})");
     }
 
-    private byte[] DecompressBlock(Block blk)
+    internal byte[] DecompressBlock(Block blk)
     {
-        var payload = Buf.AsSpan((int)blk.DataOffset, (int)blk.DataSize);
-        if (blk.Kind == "RAW") return payload.ToArray();
+        var payload = ReadAt(blk.DataOffset, checked((int)blk.DataSize));
+        if (blk.Kind == "RAW") return payload;
         if (blk.Kind != "CBLKDATA") throw new WpixFormatException($"unknown block kind {blk.Kind}");
-        var outp = WinCompress.DecompressXpressRaw(payload, (int)blk.RawSize);
+        var outp = WinCompress.DecompressXpressRaw(payload, checked((int)blk.RawSize));
         if ((ulong)outp.Length != blk.RawSize) throw new WpixFormatException($"decompressed size mismatch at 0x{blk.Offset:x}");
         return outp;
     }
 }
 
 // <EVT レコード: "<EVT" u32 type, u64 seq, u64 payloadSize, u8[40] reserved, payload ("META" u32[5] + body)
-public sealed record EvtRecord(uint StreamId, int Offset, uint Type, ulong Seq, byte[] Payload)
+// ペイロードは必要になった時に Source から読む (保持しない)
+public sealed record EvtRecord(uint StreamId, long Offset, uint Type, ulong Seq, long PayloadSize, WpixStream Source)
 {
     public const int HeaderSize = 0x40;
     public const int MetaSize = 24;
 
-    public static IEnumerable<EvtRecord> Iterate(uint streamId, byte[] data)
+    public byte[] Payload => Source.Read(Offset + HeaderSize, PayloadSize);
+
+    /// <summary>ペイロード中の body (META の後) の、ストリーム上の開始オフセット。</summary>
+    public long BodyOffset => Offset + HeaderSize + MetaSize;
+
+    public static IEnumerable<EvtRecord> Iterate(WpixStream s)
     {
-        int pos = 0;
-        while (pos < data.Length)
+        long pos = 0;
+        while (pos < s.Length)
         {
-            if (Encoding.Latin1.GetString(data, pos, 4) != "<EVT")
-                throw new WpixFormatException($"stream {streamId}: expected <EVT at 0x{pos:x}");
-            uint type = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(pos + 4));
-            ulong seq = BinaryPrimitives.ReadUInt64LittleEndian(data.AsSpan(pos + 8));
-            ulong psize = BinaryPrimitives.ReadUInt64LittleEndian(data.AsSpan(pos + 16));
-            var payload = data.AsSpan(pos + HeaderSize, (int)psize).ToArray();
-            yield return new EvtRecord(streamId, pos, type, seq, payload);
-            pos += HeaderSize + (int)psize;
+            var h = s.Read(pos, HeaderSize);
+            if (Encoding.Latin1.GetString(h, 0, 4) != "<EVT")
+                throw new WpixFormatException($"stream {s.Id}: expected <EVT at 0x{pos:x}");
+            uint type = BinaryPrimitives.ReadUInt32LittleEndian(h.AsSpan(4));
+            ulong seq = BinaryPrimitives.ReadUInt64LittleEndian(h.AsSpan(8));
+            long psize = (long)BinaryPrimitives.ReadUInt64LittleEndian(h.AsSpan(16));
+            yield return new EvtRecord(s.Id, pos, type, seq, psize, s);
+            pos += HeaderSize + psize;
         }
     }
 
     public static List<EvtRecord> All(WpixFile f) =>
-        f.Streams.SelectMany(s => Iterate(s.Id, s.Data)).OrderBy(r => r.Seq).ToList(); // 安定ソート
+        f.Streams.SelectMany(Iterate).OrderBy(r => r.Seq).ToList(); // 安定ソート
 }
